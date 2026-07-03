@@ -28,14 +28,18 @@ Example response:
       "index": 0,
       "state": "exhausted",
       "last_429_time": "2026-06-19T11:48:29Z",
-      "current": false
+      "current": false,
+      "eligible": false,
+      "retry_after_seconds": 142
     },
     {
       "index": 1,
       "state": "available",
-      "current": true
+      "current": true,
+      "eligible": true
     }
   ],
+  "retry_exhausted_after_seconds": 300,
   "note": "Remaining usage is unavailable from opencode-go API."
 }
 ```
@@ -45,6 +49,20 @@ Key states are inferred by this proxy:
 - `unknown`: key has not yet been proven available or exhausted
 - `available`: key is currently selected and not marked exhausted
 - `exhausted`: key returned a quota/usage-exhausted `429`
+
+Additional fields:
+
+- `eligible`: whether the key may be handed out on the next request. An
+  exhausted key becomes eligible again once its cooldown elapses.
+- `retry_after_seconds`: remaining cooldown for an exhausted key that is not yet
+  eligible. Omitted for eligible keys and when the cooldown is disabled.
+- `retry_exhausted_after_seconds`: the configured cooldown before an exhausted
+  key is retried automatically. `0` means the cooldown is disabled.
+
+An exhausted key is retried automatically once its cooldown elapses; the next
+real request acts as the probe. See
+[Operations and security](operations.md) for details. The all-keys-exhausted
+`429` also carries a `Retry-After` header pointing at the next probe window.
 
 ## Validate keys
 

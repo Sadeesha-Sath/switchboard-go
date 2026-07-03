@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/smtp"
@@ -31,6 +32,11 @@ type Config struct {
 	ProxyAPIKey         string
 	UpstreamAPIKeys     []string
 	MaxRequestBodyBytes int64
+	// RetryExhaustedAfter is how long a key stays exhausted before it becomes
+	// eligible for an automatic retry probe. Zero disables the cooldown so
+	// exhausted keys are retried on the very next request (client backoff is the
+	// only pacing).
+	RetryExhaustedAfter time.Duration
 	ConfigSourcePath    string
 
 	SMTP SMTPConfig
@@ -71,7 +77,7 @@ func loadConfig() (Config, error) {
 }
 
 func defaultConfig() Config {
-	return Config{ListenAddr: ":8080", UpstreamBaseURL: "https://opencode.ai/zen/go/v1", MaxRequestBodyBytes: 20 << 20, SMTP: SMTPConfig{Port: 25}}
+	return Config{ListenAddr: ":8080", UpstreamBaseURL: "https://opencode.ai/zen/go/v1", MaxRequestBodyBytes: 20 << 20, RetryExhaustedAfter: 5 * time.Minute, SMTP: SMTPConfig{Port: 25}}
 }
 
 func resolveConfigPath() (string, bool, error) {
@@ -101,8 +107,9 @@ type yamlConfig struct {
 		ProxyAPIKey string `yaml:"proxy_api_key"`
 	} `yaml:"server"`
 	Upstream struct {
-		BaseURL string   `yaml:"base_url"`
-		APIKeys []string `yaml:"api_keys"`
+		BaseURL             string   `yaml:"base_url"`
+		APIKeys             []string `yaml:"api_keys"`
+		RetryExhaustedAfter string   `yaml:"retry_exhausted_after"`
 	} `yaml:"upstream"`
 	SMTP struct {
 		Host     string `yaml:"host"`
@@ -128,7 +135,20 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(b, &yc); err != nil {
 		return Config{}, fmt.Errorf("parse config file: %w", err)
 	}
-	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	// -1 marks "not present in file" so mergeConfig can tell an explicit 0
+	// (disable cooldown) apart from an omitted value (keep the default).
+	retry := time.Duration(-1)
+	if s := strings.TrimSpace(yc.Upstream.RetryExhaustedAfter); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse retry_exhausted_after: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("retry_exhausted_after must be >= 0")
+		}
+		retry = d
+	}
+	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -146,6 +166,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.MaxRequestBodyBytes > 0 {
 		dst.MaxRequestBodyBytes = src.MaxRequestBodyBytes
+	}
+	if src.RetryExhaustedAfter >= 0 {
+		dst.RetryExhaustedAfter = src.RetryExhaustedAfter
 	}
 	if src.SMTP.Host != "" {
 		dst.SMTP.Host = src.SMTP.Host
@@ -193,6 +216,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("MAX_REQUEST_BODY_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			cfg.MaxRequestBodyBytes = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RETRY_EXHAUSTED_AFTER")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cfg.RetryExhaustedAfter = d
 		}
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {
@@ -243,11 +271,14 @@ func validateConfig(cfg Config) error {
 	if cfg.MaxRequestBodyBytes <= 0 {
 		return errors.New("MAX_REQUEST_BODY_BYTES must be > 0")
 	}
+	if cfg.RetryExhaustedAfter < 0 {
+		return errors.New("RETRY_EXHAUSTED_AFTER must be >= 0")
+	}
 	return nil
 }
 
 func safeConfigSummary(cfg Config) string {
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes)
+	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
@@ -268,26 +299,47 @@ type KeyManager struct {
 	current        int
 	allNotified    bool
 	notifiedSwitch map[int]bool
+	// cooldown is how long an exhausted key waits before it becomes eligible for
+	// an automatic retry. Zero means exhausted keys are immediately eligible
+	// again (retry on the next request).
+	cooldown time.Duration
+	// now is injectable so tests can drive the cooldown with a fake clock.
+	now func() time.Time
 }
 
-func NewKeyManager(keys []string) *KeyManager {
+func NewKeyManager(keys []string, cooldown time.Duration) *KeyManager {
 	states := make([]KeyState, len(keys))
 	for i := range states {
 		states[i] = KeyUnknown
 	}
-	return &KeyManager{keys: append([]string(nil), keys...), states: states, last429: map[int]time.Time{}, notifiedSwitch: map[int]bool{}}
+	return &KeyManager{keys: append([]string(nil), keys...), states: states, last429: map[int]time.Time{}, notifiedSwitch: map[int]bool{}, cooldown: cooldown, now: func() time.Time { return time.Now().UTC() }}
+}
+
+// eligibleLocked reports whether key i may be handed out right now. A key that is
+// not exhausted is always eligible; an exhausted key becomes eligible again once
+// its cooldown has elapsed since the last quota error (so the next real request
+// acts as a probe).
+func (m *KeyManager) eligibleLocked(i int) bool {
+	if m.states[i] != KeyExhausted {
+		return true
+	}
+	t, ok := m.last429[i]
+	if !ok {
+		return true
+	}
+	return !m.now().Before(t.Add(m.cooldown))
 }
 
 func (m *KeyManager) Current() (int, string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.keys) == 0 || m.allExhaustedLocked() {
+	if len(m.keys) == 0 {
 		return 0, "", false
 	}
-	if m.states[m.current] == KeyExhausted {
+	if !m.eligibleLocked(m.current) {
 		m.advanceLocked()
 	}
-	if m.states[m.current] == KeyExhausted {
+	if !m.eligibleLocked(m.current) {
 		return 0, "", false
 	}
 	return m.current, m.keys[m.current], true
@@ -300,7 +352,7 @@ func (m *KeyManager) MarkExhausted(i int) {
 		return
 	}
 	m.states[i] = KeyExhausted
-	m.last429[i] = time.Now().UTC()
+	m.last429[i] = m.now()
 	m.advanceLocked()
 }
 
@@ -344,12 +396,48 @@ func (m *KeyManager) advanceLocked() {
 	start := m.current
 	for step := 1; step <= len(m.keys); step++ {
 		next := (start + step) % len(m.keys)
-		if m.states[next] != KeyExhausted {
+		if m.eligibleLocked(next) {
 			m.current = next
 			return
 		}
 	}
 	m.current = start
+}
+
+// RetryAfterSeconds returns the number of seconds until the soonest exhausted key
+// becomes eligible for a retry, for use as a Retry-After header on the local
+// all-exhausted 429. The second return value is false when a Retry-After hint is
+// not meaningful: the cooldown is disabled, or some key is already usable.
+func (m *KeyManager) RetryAfterSeconds() (int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cooldown <= 0 {
+		return 0, false
+	}
+	var soonest time.Time
+	found := false
+	for i := range m.keys {
+		if m.states[i] != KeyExhausted {
+			return 0, false
+		}
+		t, ok := m.last429[i]
+		if !ok {
+			return 0, false
+		}
+		eligibleAt := t.Add(m.cooldown)
+		if !found || eligibleAt.Before(soonest) {
+			soonest = eligibleAt
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	secs := int(math.Ceil(soonest.Sub(m.now()).Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	return secs, true
 }
 
 func (m *KeyManager) AllExhausted() bool {
@@ -373,12 +461,24 @@ func (m *KeyManager) Status() StatusResponse {
 	states := make([]PerKeyStatus, len(m.keys))
 	for i := range m.keys {
 		state := m.states[i]
+		display := state
 		if i == m.current && state != KeyExhausted {
-			state = KeyAvailable
+			display = KeyAvailable
 		}
-		states[i] = PerKeyStatus{Index: i, State: string(state), Last429Time: m.last429String(i), Current: i == m.current}
+		eligible := m.eligibleLocked(i)
+		ps := PerKeyStatus{Index: i, State: string(display), Last429Time: m.last429String(i), Current: i == m.current, Eligible: eligible}
+		if state == KeyExhausted && m.cooldown > 0 && !eligible {
+			if t, ok := m.last429[i]; ok {
+				secs := int(math.Ceil(t.Add(m.cooldown).Sub(m.now()).Seconds()))
+				if secs < 0 {
+					secs = 0
+				}
+				ps.RetryAfterSeconds = secs
+			}
+		}
+		states[i] = ps
 	}
-	return StatusResponse{CurrentKeyIndex: m.current, Keys: states, Note: "unknown means the key has not yet been validated or used since startup; remaining usage is unavailable from opencode-go API."}
+	return StatusResponse{CurrentKeyIndex: m.current, Keys: states, RetryExhaustedAfterSeconds: int(m.cooldown / time.Second), Note: "unknown means the key has not yet been validated or used since startup; an exhausted key becomes eligible for an automatic retry once retry_exhausted_after_seconds has elapsed since last_429_time (0 disables the cooldown); remaining usage is unavailable from opencode-go API."}
 }
 
 func (m *KeyManager) SetState(i int, state KeyState) {
@@ -389,11 +489,15 @@ func (m *KeyManager) SetState(i int, state KeyState) {
 	}
 	m.states[i] = state
 	if state == KeyExhausted {
-		m.last429[i] = time.Now().UTC()
+		m.last429[i] = m.now()
+		return
 	}
-	if state != KeyExhausted && m.current == i {
-		m.current = i
-	}
+	// Recovery: the key is usable again. Drop its cooldown timestamp and re-arm
+	// the notification flags so a future depletion round alerts again instead of
+	// staying silent.
+	delete(m.last429, i)
+	m.notifiedSwitch[i] = false
+	m.allNotified = false
 }
 
 func (m *KeyManager) MarkAvailable(i int) { m.SetState(i, KeyAvailable) }
@@ -410,11 +514,20 @@ type PerKeyStatus struct {
 	State       string `json:"state"`
 	Last429Time string `json:"last_429_time,omitempty"`
 	Current     bool   `json:"current"`
+	// Eligible reports whether the key may be handed out on the next request. An
+	// exhausted key is eligible again once its cooldown has elapsed.
+	Eligible bool `json:"eligible"`
+	// RetryAfterSeconds is the remaining cooldown for an exhausted key that is not
+	// yet eligible. Omitted for eligible keys and when the cooldown is disabled.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 type StatusResponse struct {
 	CurrentKeyIndex int            `json:"current_key_index"`
 	Keys            []PerKeyStatus `json:"keys"`
-	Note            string         `json:"note"`
+	// RetryExhaustedAfterSeconds is the configured cooldown before an exhausted
+	// key is retried automatically. Zero means the cooldown is disabled.
+	RetryExhaustedAfterSeconds int    `json:"retry_exhausted_after_seconds"`
+	Note                       string `json:"note"`
 }
 
 type ValidateKeyResult struct {
@@ -436,7 +549,7 @@ type App struct {
 }
 
 func newApp(cfg Config) *App {
-	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP)}
+	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP)}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -662,24 +775,24 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			if a.keys.ShouldNotifySwitch(idx) {
 				a.sender.NotifySwitch(idx, a.keys.Status())
 			}
-			if a.keys.ShouldNotifyAllExhausted() {
-				a.sender.NotifyAllExhausted(a.keys.Status())
-				writeAPIError(w, style, 429, "rate_limit_exceeded", "all upstream keys exhausted")
-				return
-			}
 			continue
 		}
+		// The key served the request, so it is healthy: mark it available so a
+		// recovered (previously exhausted) key un-sticks and the notification
+		// flags re-arm for the next depletion round.
+		a.keys.MarkAvailable(idx)
 		copyResponse(w, resp)
 		return
 	}
-	if a.keys.AllExhausted() {
-		if a.keys.ShouldNotifyAllExhausted() {
-			a.sender.NotifyAllExhausted(a.keys.Status())
-		}
-		writeAPIError(w, style, 429, "rate_limit_exceeded", "all upstream keys exhausted")
-		return
+	// No eligible key remains. Fail fast locally instead of hammering upstream,
+	// and hint well-behaved clients at the next probe window via Retry-After.
+	if a.keys.ShouldNotifyAllExhausted() {
+		a.sender.NotifyAllExhausted(a.keys.Status())
 	}
-	writeAPIError(w, style, 502, "bad_gateway", "upstream unavailable")
+	if secs, ok := a.keys.RetryAfterSeconds(); ok {
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
 }
 
 func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key string, apiStyle APIStyle) (*http.Response, error) {
@@ -930,7 +1043,7 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shut)
 	}()
-	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes)
+	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

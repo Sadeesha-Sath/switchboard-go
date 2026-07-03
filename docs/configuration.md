@@ -52,6 +52,10 @@ upstream:
     - "sk-first"
     - "sk-second"
     - "sk-third"
+  # How long an exhausted key waits before it is retried automatically.
+  # Accepts a Go duration ("30s", "5m", "1h"). "0" disables the cooldown so
+  # exhausted keys are retried on the very next request.
+  retry_exhausted_after: "5m"
 
 smtp:
   host: "smtp.example.com"
@@ -77,6 +81,7 @@ limits:
 | `LISTEN_ADDR` | No | `:8080` | HTTP listen address. Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL for OpenAI-compatible and Anthropic Messages-compatible routes. |
 | `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. |
+| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. Go duration (`30s`, `5m`). `0` disables the cooldown (retry on the next request). Maps to `upstream.retry_exhausted_after`. |
 | `SMTP_HOST` | No | | SMTP host for notifications. |
 | `SMTP_PORT` | No | `25` | SMTP port. |
 | `SMTP_USERNAME` | No | | SMTP username. If empty, SMTP AUTH is skipped. |
