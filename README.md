@@ -23,6 +23,8 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - One proxy API key for your tools
 - Multiple upstream OpenCode Go keys behind the scenes
 - Automatic failover when an upstream key is exhausted
+- Automatic retry of exhausted keys after a configurable cooldown, so a
+  replenished account recovers without a restart or manual reset
 - Optional YAML config, Docker, admin status, and SMTP alerts
 
 ## Install
@@ -101,6 +103,7 @@ For opencode and Pi Coding Agent examples, see
 | `OPENCODE_GO_API_KEYS` | Yes | | Comma-separated upstream OpenCode Go API keys. |
 | `LISTEN_ADDR` | No | `:8080` | Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL. |
+| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. `0` disables it. |
 
 YAML config is also supported. See
 [docs/configuration.md](docs/configuration.md).

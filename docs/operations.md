@@ -24,8 +24,29 @@ POST /messages            -> POST https://opencode.ai/zen/go/v1/messages
 
 When an upstream key returns a quota/usage-exhausted `429`, Switchboard Go marks
 that key as exhausted, sends a best-effort SMTP notification if configured, and
-retries the same request with the next non-exhausted key. If every key is
-exhausted, it returns an error shaped for the request style.
+retries the same request with the next eligible key. If every key is exhausted,
+it returns an error shaped for the request style.
+
+### Automatic retry of exhausted keys
+
+Exhausted keys do not stay exhausted forever. Each exhausted key becomes
+eligible for an automatic retry once `retry_exhausted_after` (default 5 minutes)
+has elapsed since its last quota `429`. The next real client request is the
+probe: it is forwarded with the eligible key. If the upstream account was
+replenished the request just succeeds and the key is marked available again; if
+it is still depleted, the key is re-marked exhausted and its cooldown restarts.
+The worst-case cost is one extra failed upstream round-trip per key per cooldown
+window - there is no background goroutine and no synthetic traffic.
+
+On any successful response the key is marked available and the notification
+flags re-arm, so a later depletion round alerts again instead of staying silent.
+
+While every key is within its cooldown, the proxy fast-fails locally with a
+`429` instead of hammering upstream, and includes a `Retry-After` header pointing
+at the next probe window so well-behaved clients (for example opencode, which
+honors `Retry-After`) pace themselves. Setting `retry_exhausted_after` to `0`
+disables the cooldown: exhausted keys are retried on the very next request and no
+`Retry-After` header is sent, leaving client backoff as the only pacing.
 
 ## Security notes
 
@@ -42,7 +63,8 @@ exhausted, it returns an error shaped for the request style.
 ## Operational behavior
 
 - Startup logs include listen address, upstream base URL, upstream key count,
-  SMTP configured yes/no, config source path, and max request body bytes.
+  SMTP configured yes/no, config source path, max request body bytes, and the
+  exhausted-key retry cooldown.
 - Request bodies larger than `max_request_body_bytes` are rejected with HTTP
   `413`.
 - Hop-by-hop and proxy headers are stripped when forwarding.
@@ -53,7 +75,8 @@ exhausted, it returns an error shaped for the request style.
   `x-api-key`.
 - If an upstream stream begins successfully and then later emits an error, the
   proxy does not recover mid-stream; it only retries before a response is sent.
-- Exhausted keys remain exhausted until the process restarts.
+- Exhausted keys are retried automatically once `retry_exhausted_after` has
+  elapsed (default 5 minutes); the admin API can still reset them immediately.
 
 ## Release artifacts
 

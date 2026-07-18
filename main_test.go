@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestKeyManagerNoCurrentWhenExhausted(t *testing.T) {
-	km := NewKeyManager([]string{"a"})
+	km := NewKeyManager([]string{"a"}, time.Hour)
 	km.MarkExhausted(0)
 	if _, _, ok := km.Current(); ok {
 		t.Fatal("expected no current key")
@@ -455,5 +457,205 @@ upstream: {base_url: "https://yaml", api_keys: ["yaml1"]}
 	}
 	if cfg.ListenAddr != "0.0.0.0:9999" || cfg.ProxyAPIKey != "env" || len(cfg.UpstreamAPIKeys) != 2 || cfg.MaxRequestBodyBytes != 99 {
 		t.Fatalf("unexpected cfg: %+v", cfg)
+	}
+}
+
+func TestKeyManagerRetryEligibleAfterCooldown(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	km := NewKeyManager([]string{"a"}, time.Minute)
+	km.now = func() time.Time { return now }
+	km.MarkExhausted(0)
+	if _, _, ok := km.Current(); ok {
+		t.Fatal("expected no eligible key immediately after exhaustion")
+	}
+	now = now.Add(59 * time.Second)
+	if _, _, ok := km.Current(); ok {
+		t.Fatal("expected key still in cooldown at 59s")
+	}
+	now = now.Add(2 * time.Second) // 61s since exhaustion
+	idx, key, ok := km.Current()
+	if !ok || idx != 0 || key != "a" {
+		t.Fatalf("expected key eligible after cooldown, got idx=%d key=%q ok=%v", idx, key, ok)
+	}
+}
+
+func TestKeyManagerZeroCooldownImmediatelyEligible(t *testing.T) {
+	km := NewKeyManager([]string{"a"}, 0)
+	km.MarkExhausted(0)
+	idx, key, ok := km.Current()
+	if !ok || idx != 0 || key != "a" {
+		t.Fatalf("expected exhausted key immediately eligible with zero cooldown, got ok=%v", ok)
+	}
+}
+
+func TestKeyManagerRetryAfterSeconds(t *testing.T) {
+	now := time.Unix(2000, 0).UTC()
+	km := NewKeyManager([]string{"a", "b"}, 2*time.Minute)
+	km.now = func() time.Time { return now }
+	km.MarkExhausted(0) // eligible at t=2120
+	now = now.Add(30 * time.Second)
+	km.MarkExhausted(1) // eligible at t=2150
+	secs, ok := km.RetryAfterSeconds()
+	if !ok || secs != 90 { // soonest 2120 - now 2030
+		t.Fatalf("expected retry-after 90s, got %d ok=%v", secs, ok)
+	}
+
+	km2 := NewKeyManager([]string{"a"}, 0)
+	km2.MarkExhausted(0)
+	if _, ok := km2.RetryAfterSeconds(); ok {
+		t.Fatal("expected no retry-after hint when cooldown is disabled")
+	}
+}
+
+func TestKeyManagerReArmsNotificationsOnRecovery(t *testing.T) {
+	km := NewKeyManager([]string{"a", "b"}, time.Minute)
+	km.MarkExhausted(0)
+	km.MarkExhausted(1)
+	if !km.ShouldNotifyAllExhausted() {
+		t.Fatal("expected first all-exhausted notification")
+	}
+	if km.ShouldNotifyAllExhausted() {
+		t.Fatal("expected all-exhausted notification suppressed the second time")
+	}
+	if !km.ShouldNotifySwitch(0) {
+		t.Fatal("expected switch notification for key 0")
+	}
+	// Recovery of a key must re-arm both the switch flag and the all-exhausted flag.
+	km.MarkAvailable(0)
+	if !km.ShouldNotifySwitch(0) {
+		t.Fatal("expected switch notification re-armed after recovery")
+	}
+	km.MarkExhausted(0)
+	if !km.ShouldNotifyAllExhausted() {
+		t.Fatal("expected all-exhausted notification re-armed after a recovery round")
+	}
+}
+
+func doProxyReq(app *App) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.1","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestProxyRetriesExhaustedKeyAfterCooldown(t *testing.T) {
+	var replenished atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if replenished.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded","code":"insufficient_quota"}}`))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024, RetryExhaustedAfter: time.Minute})
+	now := time.Unix(5000, 0).UTC()
+	app.keys.now = func() time.Time { return now }
+
+	// First request: the only key quota-fails, so the proxy returns a local 429
+	// carrying a Retry-After hint pointing at the next probe window.
+	rec := doProxyReq(app)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d body %s", rec.Code, rec.Body.String())
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "60" {
+		t.Fatalf("expected Retry-After 60, got %q", ra)
+	}
+
+	// Within the cooldown the proxy fast-fails without probing upstream again.
+	rec = doProxyReq(app)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 during cooldown, got %d", rec.Code)
+	}
+
+	// Cooldown elapses and the account is replenished: the next real request acts
+	// as a probe and succeeds.
+	now = now.Add(2 * time.Minute)
+	replenished.Store(true)
+	rec = doProxyReq(app)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 after cooldown+replenish, got %d body %s", rec.Code, rec.Body.String())
+	}
+	st := app.keys.Status()
+	if st.Keys[0].State != string(KeyAvailable) || !st.Keys[0].Eligible {
+		t.Fatalf("expected key available and eligible after recovery, got %+v", st.Keys[0])
+	}
+	if st.RetryExhaustedAfterSeconds != 60 {
+		t.Fatalf("expected retry_exhausted_after_seconds 60, got %d", st.RetryExhaustedAfterSeconds)
+	}
+}
+
+func TestProxyZeroCooldownNoRetryAfterHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded","code":"insufficient_quota"}}`))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024, RetryExhaustedAfter: 0})
+	rec := doProxyReq(app)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "" {
+		t.Fatalf("expected no Retry-After header with cooldown disabled, got %q", ra)
+	}
+}
+
+func TestLoadConfigRetryExhaustedAfterParsedAndOverridden(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := []byte("server: {proxy_api_key: \"p\"}\nupstream: {base_url: \"https://x\", api_keys: [\"k\"], retry_exhausted_after: \"90s\"}\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetryExhaustedAfter != 90*time.Second {
+		t.Fatalf("expected 90s from yaml, got %s", cfg.RetryExhaustedAfter)
+	}
+	t.Setenv("RETRY_EXHAUSTED_AFTER", "5m")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetryExhaustedAfter != 5*time.Minute {
+		t.Fatalf("expected env override to 5m, got %s", cfg.RetryExhaustedAfter)
+	}
+}
+
+func TestLoadConfigRetryExhaustedAfterDefaultAndExplicitZero(t *testing.T) {
+	dir := t.TempDir()
+	omitted := filepath.Join(dir, "omitted.yaml")
+	if err := os.WriteFile(omitted, []byte("server: {proxy_api_key: \"p\"}\nupstream: {base_url: \"https://x\", api_keys: [\"k\"]}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", omitted)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetryExhaustedAfter != 5*time.Minute {
+		t.Fatalf("expected default 5m when omitted, got %s", cfg.RetryExhaustedAfter)
+	}
+
+	zero := filepath.Join(dir, "zero.yaml")
+	if err := os.WriteFile(zero, []byte("server: {proxy_api_key: \"p\"}\nupstream: {base_url: \"https://x\", api_keys: [\"k\"], retry_exhausted_after: \"0\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", zero)
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetryExhaustedAfter != 0 {
+		t.Fatalf("expected explicit 0 to disable cooldown, got %s", cfg.RetryExhaustedAfter)
 	}
 }
