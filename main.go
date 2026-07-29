@@ -221,6 +221,10 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("RETRY_EXHAUSTED_AFTER")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
 			cfg.RetryExhaustedAfter = d
+		} else {
+			// Preserve an invalid sentinel so validateConfig reports the typo
+			// instead of silently retaining a different YAML/default value.
+			cfg.RetryExhaustedAfter = -1
 		}
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {

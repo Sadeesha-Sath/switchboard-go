@@ -659,3 +659,17 @@ func TestLoadConfigRetryExhaustedAfterDefaultAndExplicitZero(t *testing.T) {
 		t.Fatalf("expected explicit 0 to disable cooldown, got %s", cfg.RetryExhaustedAfter)
 	}
 }
+
+func TestLoadConfigRejectsInvalidRetryExhaustedAfterEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := []byte("server: {proxy_api_key: \"p\"}\nupstream: {base_url: \"https://x\", api_keys: [\"k\"]}\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+	t.Setenv("RETRY_EXHAUSTED_AFTER", "not-a-duration")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "RETRY_EXHAUSTED_AFTER") {
+		t.Fatalf("expected RETRY_EXHAUSTED_AFTER validation error, got %v", err)
+	}
+}
