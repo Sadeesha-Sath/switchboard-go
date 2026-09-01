@@ -52,6 +52,9 @@ Key states are inferred by this proxy:
 
 Additional fields:
 
+- `key_hint`: masked identifier for the key (first 7 and last 4 characters, e.g.
+  `sk-5R6d…z28B`) so keys with identical priority/weight can be told apart.
+  Short keys are fully masked (`…`). The full key is never returned.
 - `eligible`: whether the key may be handed out on the next request. An
   exhausted key becomes eligible again once its cooldown elapses.
 - `retry_after_seconds`: remaining cooldown for an exhausted key that is not yet
@@ -198,6 +201,23 @@ switchboard_quota_usage_percent{key_index="0",window="monthly"} 10.00
 # TYPE switchboard_active_sessions gauge
 switchboard_active_sessions 3
 ```
+
+## Dashboard
+
+A static web dashboard is embedded in the binary and served without
+authentication:
+
+- `GET /` redirects to `/dashboard/`
+- `GET /dashboard/` serves the dashboard shell (HTML/JS/CSS)
+
+The shell itself contains no sensitive data. Its JavaScript calls the
+authenticated endpoints above using the proxy key entered in the dashboard's
+Settings panel.
+
+`GET /dashboard/api/metrics.json` returns the [Prometheus metrics](#prometheus-metrics)
+contents as structured JSON (request counters, latencies, per-key upstream
+traffic, exhaustions, switches, active sessions) plus `model_aliases` from the
+configuration. Like `/metrics`, it is unauthenticated and contains no API keys.
 
 ## Reset key manually
 

@@ -4,3 +4,5 @@ config.yaml
 config.yml
 .DS_Store
 .worktrees/
+node_modules/
+!web/dashboard/dist/

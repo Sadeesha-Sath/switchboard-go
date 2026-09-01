@@ -1509,6 +1509,7 @@ func (m *KeyManager) Status() StatusResponse {
 		eligible := m.eligibleLocked(i)
 		ps := PerKeyStatus{
 			Index:       i,
+			KeyHint:     maskKeyHint(m.keys[i]),
 			State:       string(display),
 			Priority:    m.priorities[i],
 			Weight:      m.weights[i],
@@ -1599,6 +1600,7 @@ func (m *KeyManager) last429String(i int) string {
 
 type PerKeyStatus struct {
 	Index             int    `json:"index"`
+	KeyHint           string `json:"key_hint,omitempty"`
 	State             string `json:"state"`
 	Priority          int    `json:"priority"`
 	Weight            int    `json:"weight"`
@@ -1641,6 +1643,7 @@ type UsageSummary struct {
 
 type PerKeyUsage struct {
 	Index             int         `json:"index"`
+	KeyHint           string      `json:"key_hint,omitempty"`
 	State             string      `json:"state"`
 	Priority          int         `json:"priority"`
 	Weight            int         `json:"weight"`
@@ -1694,6 +1697,7 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 
 		pku := PerKeyUsage{
 			Index:    i,
+			KeyHint:  maskKeyHint(m.keys[i]),
 			State:    string(display),
 			Priority: m.priorities[i],
 			Weight:   m.weights[i],
@@ -1916,7 +1920,7 @@ func (m *MetricsRegistry) RecordUpstreamRequest(keyIndex, priority, status int, 
 	reqKey := fmt.Sprintf(`key_index="%d",priority="%d",status="%d"`, keyIndex, priority, status)
 	m.upstreamRequestsTotal[reqKey]++
 
-	durKey := fmt.Sprintf(`key_index="%d"`, keyIndex)
+	durKey := fmt.Sprintf(`key_index="%d",priority="%d",status="%d"`, keyIndex, priority, status)
 	m.upstreamDurationSum[durKey] += duration
 	m.upstreamDurationCount[durKey]++
 }
@@ -2116,6 +2120,8 @@ func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdmin(w, r)
+	case r.URL.Path == "/" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/"):
+		a.handleDashboard(w, r)
 	case isProxyPath(r.URL.Path):
 		if !a.authOK(r) {
 			writeAPIError(w, apiStyleForRequest(r), http.StatusUnauthorized, "invalid_api_key", "Unauthorized")

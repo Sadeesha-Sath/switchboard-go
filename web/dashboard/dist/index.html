@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="/dashboard/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Switchboard Go — Dashboard</title>
+    <script type="module" crossorigin src="/dashboard/assets/index-CP4J-Utk.js"></script>
+    <link rel="stylesheet" crossorigin href="/dashboard/assets/index-CgjkUrAp.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="/dashboard/logo.png" alt="Switchboard Go" class="logo" />
+        <div>
+          <h1>Switchboard Go</h1>
+          <span id="base-url-label" class="muted small"></span>
+        </div>
+      </div>
+      <div class="controls">
+        <label class="small muted" for="interval">Auto</label>
+        <select id="interval">
+          <option value="5000">5s</option>
+          <option value="10000" selected>10s</option>
+          <option value="30000">30s</option>
+          <option value="0">Off</option>
+        </select>
+        <button id="refresh" class="btn">Refresh</button>
+        <button id="settings-toggle" class="btn">Settings</button>
+      </div>
+    </header>
+
+    <div id="error-banner" class="banner" hidden></div>
+
+    <section id="settings" class="settings" hidden>
+      <form id="settings-form">
+        <label>
+          Proxy base URL
+          <input type="text" id="base-url" placeholder="http://127.0.0.1:8495 (blank = this origin)" autocomplete="url" />
+        </label>
+        <label>
+          Proxy API key
+          <input type="password" id="proxy-key" placeholder="server.proxy_api_key from config.yaml" autocomplete="off" />
+        </label>
+        <div class="settings-actions">
+          <button type="submit" class="btn primary">Save</button>
+          <button type="button" id="clear-key" class="btn danger">Clear key</button>
+        </div>
+        <p class="muted small">
+          The key is the <code>server.proxy_api_key</code> from your config.yaml (e.g.
+          <code>bin/config.yaml</code>). It is stored only in this browser's localStorage and sent as
+          <code>Authorization: Bearer</code>.
+        </p>
+      </form>
+    </section>
+
+    <main>
+      <section id="summary" class="cards"></section>
+      <section id="pool"></section>
+      <section id="keys"></section>
+      <section id="metrics"></section>
+    </main>
+
+    <footer id="footer" class="footer"></footer>
+
+  </body>
+</html>

@@ -28,6 +28,7 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - **Prometheus Metrics (`/metrics`)**: Production-ready exposition endpoint tracking requests, durations, key statuses, switches, 429s, and quota usage
 - **Dynamic Configuration Reloading (`/admin/reload`, `SIGHUP`)**: Hot-reload keys, priorities, weights, aliases, and webhooks in-memory without downtime
 - **Aggregated Quota Endpoint (`/usage`, `/v1/usage`)**: Compatible with OpenCode widget tools (Waybar, Polybar, VS Code) while exposing full pool metrics
+- **Built-in Web Dashboard (`/dashboard`)**: Local UI for per-key quota, pool usage, live metrics, and admin actions (validate, reset, reload)
 - **Multi-Strategy Routing**: `session_sticky` (default) preserves upstream KV prompt caching across agent turns; `balanced`, `round_robin`, and `fill_first` also available
 - **Proactive Quota Switching**: Automatically switches away from subscriptions at $\ge 95\%$ capacity before hitting 429 errors
 - **Dynamic Reset Cooldown & Recovery**: Keys cool down until their exact upstream `resetsAt` and automatically recover when quota resets
@@ -118,6 +119,24 @@ For opencode and Pi Coding Agent examples, see
 
 YAML config is also supported. See
 [docs/configuration.md](docs/configuration.md).
+
+## Web dashboard
+
+A built-in dashboard is served at:
+
+```text
+http://127.0.0.1:8080/dashboard/
+```
+
+It shows per-key quota windows (rolling/weekly/monthly), pool aggregates, key
+states and cooldowns, live request/latency metrics, and the admin actions
+(validate keys, reset keys, reload config). Model aliases from your config are
+listed in the footer.
+
+The dashboard shell loads without authentication. Data calls use your
+`PROXY_API_KEY`, entered once in the dashboard's Settings panel and stored in
+the browser's localStorage; every request is sent as
+`Authorization: Bearer $PROXY_API_KEY`.
 
 ## Usage and admin endpoints
 
