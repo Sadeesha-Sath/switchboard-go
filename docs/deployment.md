@@ -37,6 +37,7 @@ Example `/etc/switchboard-go/switchboard.env`:
 ```bash
 PROXY_API_KEY=replace-with-a-long-random-local-key
 OPENCODE_GO_API_KEYS=sk-first,sk-second,sk-third
+ROUTING_STRATEGY=session_sticky
 SMTP_PASSWORD=replace-me
 ```
 

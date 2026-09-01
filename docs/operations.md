@@ -23,30 +23,34 @@ POST /messages            -> POST https://opencode.ai/zen/go/v1/messages
 ```
 
 When an upstream key returns a quota/usage-exhausted `429`, Switchboard Go marks
-that key as exhausted, sends a best-effort SMTP notification if configured, and
+that key as exhausted, invalidates any session bindings to it, sends a best-effort SMTP notification if configured, and
 retries the same request with the next eligible key. If every key is exhausted,
 it returns an error shaped for the request style.
 
-### Automatic retry of exhausted keys
+### Proactive Quota Switching
 
-Exhausted keys do not stay exhausted forever. Each exhausted key becomes
-eligible for an automatic retry once `retry_exhausted_after` (default 5 minutes)
-has elapsed since its last quota `429`. The next real client request is the
-probe: it is forwarded with the eligible key. If the upstream account was
-replenished the request just succeeds and the key is marked available again; if
-it is still depleted, the key is re-marked exhausted and its cooldown restarts.
-The worst-case cost is one extra failed upstream round-trip per key per cooldown
-window - there is no background goroutine and no synthetic traffic.
+Rather than waiting for an upstream `429` error mid-turn, Switchboard Go continuously polls upstream `/usage` every 30 seconds (`usage_check_interval`). When a key's rolling window reaches $\ge 95\%$ (`proactive_switch_threshold`), Switchboard Go proactively avoids assigning new requests to that key if healthier keys (< 95%) are available in the pool.
 
-On any successful response the key is marked available and the notification
-flags re-arm, so a later depletion round alerts again instead of staying silent.
+### Dynamic `resetsAt` Cooldown & Automatic Recovery
+
+Exhausted keys do not stay exhausted forever:
+
+1. **Exact upstream reset**: If the upstream `/usage` payload or error provides a `resetsAt` timestamp, the key is cooled down until that exact timestamp.
+2. **Automatic quota recovery**: When periodic usage polling confirms that a previously exhausted key has refreshed (rolling usage < proactive threshold), Switchboard Go automatically restores the key to `available` state without requiring a restart or manual reset.
+3. **Fallback cooldown**: If reset time is unavailable, the proxy falls back to `retry_exhausted_after` (default 5 minutes).
 
 While every key is within its cooldown, the proxy fast-fails locally with a
 `429` instead of hammering upstream, and includes a `Retry-After` header pointing
-at the next probe window so well-behaved clients (for example opencode, which
-honors `Retry-After`) pace themselves. Setting `retry_exhausted_after` to `0`
-disables the cooldown: exhausted keys are retried on the very next request and no
-`Retry-After` header is sent, leaving client backoff as the only pacing.
+at the earliest reset time so well-behaved clients pace themselves.
+
+### Multi-Strategy Routing & Upstream Prompt Cache Preservation
+
+Switchboard Go supports multiple routing strategies configured via `routing_strategy`:
+
+- **`session_sticky`** (default): High-performance coding agents and chatbots send repeated prompt prefixes. By hashing conversation identifiers (or headers like `x-session-id`), all requests in the same session stick to the same upstream key for up to 2 hours of inactivity (`session_ttl`). This maximizes upstream KV prompt cache hits and dramatically reduces response latency.
+- **`balanced`**: For scenarios where multi-agent sessions share keys, `balanced` allows requests in rapid succession to stick to the active key (within `balanced_idle_timeout`, default 1h) to preserve short-lived KV caches, while distributing subsequent batches to the key with lowest cumulative usage.
+- **`round_robin`**: Traditional request-by-request load balancing across all available keys.
+- **`fill_first`**: Fills subscription keys sequentially one by one up to the proactive threshold.
 
 ## Security notes
 

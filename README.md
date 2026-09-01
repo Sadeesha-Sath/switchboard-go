@@ -22,9 +22,11 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
   requests
 - One proxy API key for your tools
 - Multiple upstream OpenCode Go keys behind the scenes
+- **Aggregated Quota Endpoint (`/usage`, `/v1/usage`)**: Compatible with OpenCode widget tools (Waybar, Polybar, VS Code) while exposing full pool metrics
+- **Multi-Strategy Routing**: `session_sticky` (default) preserves upstream KV prompt caching across agent turns; `balanced`, `round_robin`, and `fill_first` also available
+- **Proactive Quota Switching**: Automatically switches away from subscriptions at $\ge 95\%$ capacity before hitting 429 errors
+- **Dynamic Reset Cooldown & Recovery**: Keys cool down until their exact upstream `resetsAt` and automatically recover when quota resets
 - Automatic failover when an upstream key is exhausted
-- Automatic retry of exhausted keys after a configurable cooldown, so a
-  replenished account recovers without a restart or manual reset
 - Optional YAML config, Docker, admin status, and SMTP alerts
 
 ## Install
@@ -103,17 +105,25 @@ For opencode and Pi Coding Agent examples, see
 | `OPENCODE_GO_API_KEYS` | Yes | | Comma-separated upstream OpenCode Go API keys. |
 | `LISTEN_ADDR` | No | `:8080` | Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL. |
-| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. `0` disables it. |
+| `ROUTING_STRATEGY` | No | `session_sticky` | Strategy (`session_sticky`, `balanced`, `round_robin`, `fill_first`). |
+| `SESSION_TTL` | No | `2h` | Inactivity TTL for session stickiness. |
+| `BALANCED_IDLE_TIMEOUT` | No | `1h` | Idle gap timeout before `balanced` strategy switches keys. |
+| `USAGE_CHECK_INTERVAL` | No | `30s` | Polling frequency for upstream key quota telemetry. |
+| `PROACTIVE_SWITCH_THRESHOLD` | No | `95.0` | Rolling usage % at which proxy proactively rotates keys. |
+| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Fallback cooldown before an exhausted key is retried. `0` disables it. |
 
 YAML config is also supported. See
 [docs/configuration.md](docs/configuration.md).
 
-## Admin endpoints
+## Usage and admin endpoints
 
 Use `Authorization: Bearer $PROXY_API_KEY`:
 
-- `GET /admin/status`
-- `POST /admin/validate-keys`
+- `GET /usage` or `GET /v1/usage` (aggregated quota, supports `?refresh=true`)
+- `GET /admin/status` (in-memory key states and cooldown status)
+- `POST /admin/validate-keys` (active probe of all keys against `/models`)
+- `POST /admin/reset-key` (un-exhaust a specific key by index)
+- `POST /admin/reset-all-keys` (un-exhaust all keys immediately)
 
 Health checks:
 

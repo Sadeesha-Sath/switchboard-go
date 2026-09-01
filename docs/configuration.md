@@ -52,9 +52,19 @@ upstream:
     - "sk-first"
     - "sk-second"
     - "sk-third"
-  # How long an exhausted key waits before it is retried automatically.
-  # Accepts a Go duration ("30s", "5m", "1h"). "0" disables the cooldown so
-  # exhausted keys are retried on the very next request.
+  # Routing strategy: "session_sticky" (default), "balanced", "round_robin", "fill_first"
+  routing_strategy: "session_sticky"
+  # How long an idle session retains its assigned key before re-evaluating (default: 2h)
+  session_ttl: "2h"
+  # In balanced mode, max idle gap before switching to a key with lower quota (default: 1h)
+  balanced_idle_timeout: "1h"
+  # Upstream /usage polling interval for quota tracking and automatic recovery (default: 30s)
+  usage_check_interval: "30s"
+  # Rolling window percent threshold at which the proxy proactively rotates keys (default: 95.0)
+  proactive_switch_threshold: 95.0
+  # Disable background usage polling (default: false)
+  disable_usage_polling: false
+  # Fallback cooldown before an exhausted key is retried if resetsAt is unavailable (default: 5m)
   retry_exhausted_after: "5m"
 
 smtp:
@@ -71,6 +81,13 @@ limits:
   max_request_body_bytes: 20971520
 ```
 
+## Routing Strategies
+
+- **`session_sticky`** (default): Routes all requests for a session/conversation to the same upstream key as long as it has capacity (< 95% rolling usage). New sessions are assigned to the subscription key with the lowest weekly/monthly usage. Retains KV prompt caches across back-and-forth chat turns. Sessions expire after 2 hours of inactivity (`session_ttl`).
+- **`balanced`**: Requests made within rapid succession (idle gap < `balanced_idle_timeout`, default 1h) stick to the current key to preserve active prompt caches. When an idle gap occurs, Switchboard Go re-evaluates the key pool and routes subsequent requests to the key with the lowest weekly/monthly quota.
+- **`round_robin`**: Rotates sequentially through eligible, non-saturated keys on every request.
+- **`fill_first`**: Fills Key 0 up to the proactive switch threshold (default 95%) or exhaustion, then moves to Key 1, Key 2, etc.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
@@ -79,9 +96,15 @@ limits:
 | `PROXY_API_KEY` | Yes\* | | API key clients must use to access this proxy. |
 | `OPENCODE_GO_API_KEYS` | Yes\* | | Comma-separated OpenCode Go API keys. |
 | `LISTEN_ADDR` | No | `:8080` | HTTP listen address. Use `127.0.0.1:8080` for local-only access. |
-| `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL for OpenAI-compatible and Anthropic Messages-compatible routes. |
+| `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL. |
+| `ROUTING_STRATEGY` | No | `session_sticky` | Key selection strategy (`session_sticky`, `balanced`, `round_robin`, `fill_first`). |
+| `SESSION_TTL` | No | `2h` | Inactivity duration after which a session mapping expires. |
+| `BALANCED_IDLE_TIMEOUT` | No | `1h` | Idle gap duration before `balanced` strategy switches keys. |
+| `USAGE_CHECK_INTERVAL` | No | `30s` | Polling frequency for upstream key quota telemetry. |
+| `PROACTIVE_SWITCH_THRESHOLD` | No | `95.0` | Rolling usage percentage at which proxy proactively rotates away from a key. |
+| `DISABLE_USAGE_POLLING` | No | `false` | Disable background usage polling. |
 | `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. |
-| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. Go duration (`30s`, `5m`). `0` disables the cooldown (retry on the next request). Maps to `upstream.retry_exhausted_after`. |
+| `RETRY_EXHAUSTED_AFTER` | No | `5m` | Fallback cooldown before an exhausted key is retried. `0` disables cooldown. |
 | `SMTP_HOST` | No | | SMTP host for notifications. |
 | `SMTP_PORT` | No | `25` | SMTP port. |
 | `SMTP_USERNAME` | No | | SMTP username. If empty, SMTP AUTH is skipped. |
@@ -112,5 +135,7 @@ Example env file for systemd:
 ```bash
 PROXY_API_KEY=replace-with-a-long-random-local-key
 OPENCODE_GO_API_KEYS=sk-first,sk-second,sk-third
+ROUTING_STRATEGY=session_sticky
+SESSION_TTL=2h
 SMTP_PASSWORD=replace-me
 ```

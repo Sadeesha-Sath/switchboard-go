@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -671,5 +673,490 @@ func TestLoadConfigRejectsInvalidRetryExhaustedAfterEnv(t *testing.T) {
 	t.Setenv("RETRY_EXHAUSTED_AFTER", "not-a-duration")
 	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "RETRY_EXHAUSTED_AFTER") {
 		t.Fatalf("expected RETRY_EXHAUSTED_AFTER validation error, got %v", err)
+	}
+}
+
+func TestParseUpstreamUsage(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	// Format 1: Nested under "usage" with ISO8601 string
+	raw1 := []byte(`{
+		"usage": {
+			"rolling": {"status": "ok", "percent": 45.5, "resetsAt": "2026-09-01T15:00:00Z"},
+			"weekly": {"status": "ok", "percent": 60, "resetsAt": "2026-09-07T00:00:00Z"},
+			"monthly": {"status": "ok", "percent": 25.0, "resetsAt": "2026-10-01T00:00:00Z"}
+		}
+	}`)
+	u1, err := parseUpstreamUsage(raw1, now)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if u1.Rolling.Percent != 45.5 || u1.Rolling.ResetsAt.Hour() != 15 {
+		t.Fatalf("unexpected rolling: %+v", u1.Rolling)
+	}
+	if u1.Weekly.Percent != 60 || u1.Weekly.ResetsAt.Day() != 7 {
+		t.Fatalf("unexpected weekly: %+v", u1.Weekly)
+	}
+
+	// Format 2: Flat with resetsInSeconds and integer percent
+	raw2 := []byte(`{
+		"rolling": {"status": "warning", "percent": 96, "resetsInSeconds": 3600},
+		"weekly": {"status": "ok", "percent": 40},
+		"monthly": {"status": "ok", "percent": "20.5"}
+	}`)
+	u2, err := parseUpstreamUsage(raw2, now)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if u2.Rolling.Percent != 96 || u2.Rolling.Status != "warning" {
+		t.Fatalf("unexpected rolling: %+v", u2.Rolling)
+	}
+	expectedReset := now.Add(1 * time.Hour)
+	if !u2.Rolling.ResetsAt.Equal(expectedReset) {
+		t.Fatalf("expected reset %v, got %v", expectedReset, u2.Rolling.ResetsAt)
+	}
+	if u2.Monthly.Percent != 20.5 {
+		t.Fatalf("expected monthly 20.5, got %v", u2.Monthly.Percent)
+	}
+}
+
+func TestSessionManager(t *testing.T) {
+	fakeTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	sm := NewSessionManager(2 * time.Hour)
+	sm.now = func() time.Time { return fakeTime }
+
+	if _, ok := sm.GetKey("s1"); ok {
+		t.Fatalf("expected non-existent session to return false")
+	}
+
+	sm.SetKey("s1", 2)
+	k, ok := sm.GetKey("s1")
+	if !ok || k != 2 {
+		t.Fatalf("expected key 2, got %d (ok=%t)", k, ok)
+	}
+	if sm.ActiveCount() != 1 {
+		t.Fatalf("expected active count 1, got %d", sm.ActiveCount())
+	}
+
+	// Advance time within TTL (1 hour)
+	fakeTime = fakeTime.Add(1 * time.Hour)
+	k, ok = sm.GetKey("s1")
+	if !ok || k != 2 {
+		t.Fatalf("expected session to remain active")
+	}
+
+	// Advance past 2h idle TTL without touch
+	fakeTime = fakeTime.Add(2*time.Hour + 1*time.Minute)
+	if _, ok := sm.GetKey("s1"); ok {
+		t.Fatalf("expected session to expire after idle TTL")
+	}
+	if sm.ActiveCount() != 0 {
+		t.Fatalf("expected active count 0, got %d", sm.ActiveCount())
+	}
+
+	// Test InvalidateKey
+	sm.SetKey("s2", 1)
+	sm.SetKey("s3", 1)
+	sm.SetKey("s4", 0)
+	sm.InvalidateKey(1)
+	if _, ok := sm.GetKey("s2"); ok {
+		t.Fatalf("expected s2 to be invalidated")
+	}
+	if _, ok := sm.GetKey("s3"); ok {
+		t.Fatalf("expected s3 to be invalidated")
+	}
+	if k, ok := sm.GetKey("s4"); !ok || k != 0 {
+		t.Fatalf("expected s4 to remain valid")
+	}
+}
+
+func TestExtractSessionID(t *testing.T) {
+	// From Header
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("x-session-id", "sess-123")
+	if sid := extractSessionID(req, nil); sid != "sess-123" {
+		t.Fatalf("expected sess-123, got %s", sid)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req2.Header.Set("x-conversation-id", "conv-456")
+	if sid := extractSessionID(req2, nil); sid != "conv-456" {
+		t.Fatalf("expected conv-456, got %s", sid)
+	}
+
+	// From JSON body user field
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	body3 := []byte(`{"model":"minimax-m3","user":"agent-user-789","messages":[{"role":"user","content":"hello"}]}`)
+	if sid := extractSessionID(req3, body3); sid != "agent-user-789" {
+		t.Fatalf("expected agent-user-789, got %s", sid)
+	}
+
+	// From JSON body prompt hash
+	req4 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	body4 := []byte(`{"model":"minimax-m3","messages":[{"role":"user","content":"repeat prompt for hashing test"}]}`)
+	sid4 := extractSessionID(req4, body4)
+	if !strings.HasPrefix(sid4, "conv_") {
+		t.Fatalf("expected conv_ prefix from hashed messages, got %s", sid4)
+	}
+	// Verify deterministic hashing
+	sid4b := extractSessionID(req4, body4)
+	if sid4 != sid4b {
+		t.Fatalf("expected identical hash for identical message content")
+	}
+}
+
+func TestRoutingStrategySessionSticky(t *testing.T) {
+	km := NewKeyManagerWithConfig([]string{"key0", "key1", "key2"}, 5*time.Minute, "session_sticky", 2*time.Hour, 5*time.Minute, 95.0)
+
+	// Set usage: key0 has 40% weekly, key1 has 10% weekly, key2 has 70% weekly
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 40}, Rolling: UsageWindow{Percent: 20}}, "")
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 10}, Rolling: UsageWindow{Percent: 20}}, "")
+	km.UpdateUsage(2, &KeyUsage{Weekly: UsageWindow{Percent: 70}, Rolling: UsageWindow{Percent: 20}}, "")
+
+	// New session should be assigned to lowest weekly usage (key1)
+	idx, key, ok := km.KeyForRequest("sess-A")
+	if !ok || idx != 1 || key != "key1" {
+		t.Fatalf("expected sess-A assigned to key1 (lowest weekly), got index %d key %s", idx, key)
+	}
+
+	// Subsequent requests from same session MUST stick to key1
+	idx, key, ok = km.KeyForRequest("sess-A")
+	if !ok || idx != 1 || key != "key1" {
+		t.Fatalf("expected sess-A to stick to key1, got index %d key %s", idx, key)
+	}
+
+	// Now key1 usage increases to 96% rolling (proactively saturated)
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 10}, Rolling: UsageWindow{Percent: 96}}, "")
+
+	// Request from sess-A should now proactively switch away to the next best key (key0)
+	idx, key, ok = km.KeyForRequest("sess-A")
+	if !ok || idx != 0 || key != "key0" {
+		t.Fatalf("expected sess-A to proactively switch to key0 (40%% weekly), got index %d key %s", idx, key)
+	}
+}
+
+func TestRoutingStrategyBalanced(t *testing.T) {
+	fakeTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	km := NewKeyManagerWithConfig([]string{"key0", "key1"}, 5*time.Minute, "balanced", 2*time.Hour, 1*time.Hour, 95.0)
+	km.now = func() time.Time { return fakeTime }
+
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 20}, Rolling: UsageWindow{Percent: 10}}, "")
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 50}, Rolling: UsageWindow{Percent: 10}}, "")
+
+	// Initial request picks key0 (lowest usage)
+	idx, key, ok := km.KeyForRequest("")
+	if !ok || idx != 0 || key != "key0" {
+		t.Fatalf("expected key0, got %d %s", idx, key)
+	}
+
+	// Usage updates in background so key1 becomes lowest (5% weekly) while key0 is 80%
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 80}, Rolling: UsageWindow{Percent: 10}}, "")
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 5}, Rolling: UsageWindow{Percent: 10}}, "")
+
+	// Request 30 minutes later (within balanced_idle_timeout of 1h) -> sticks to key0 to preserve upstream prompt cache
+	fakeTime = fakeTime.Add(30 * time.Minute)
+	idx, key, ok = km.KeyForRequest("")
+	if !ok || idx != 0 || key != "key0" {
+		t.Fatalf("expected to stick to key0 within idle window, got %d %s", idx, key)
+	}
+
+	// Request 65 minutes later (exceeding 1h balanced_idle_timeout) -> re-evaluates and switches to key1 (lowest usage)
+	fakeTime = fakeTime.Add(65 * time.Minute)
+	idx, key, ok = km.KeyForRequest("")
+	if !ok || idx != 1 || key != "key1" {
+		t.Fatalf("expected to switch to key1 after idle timeout, got %d %s", idx, key)
+	}
+}
+
+func TestRoutingStrategyRoundRobin(t *testing.T) {
+	km := NewKeyManagerWithConfig([]string{"key0", "key1", "key2"}, 5*time.Minute, "round_robin", 2*time.Hour, 5*time.Minute, 95.0)
+
+	idx0, _, _ := km.KeyForRequest("")
+	idx1, _, _ := km.KeyForRequest("")
+	idx2, _, _ := km.KeyForRequest("")
+	idx3, _, _ := km.KeyForRequest("")
+
+	if idx0 != 0 || idx1 != 1 || idx2 != 2 || idx3 != 0 {
+		t.Fatalf("expected sequential 0,1,2,0 round robin, got %d,%d,%d,%d", idx0, idx1, idx2, idx3)
+	}
+}
+
+func TestRoutingStrategyFillFirst(t *testing.T) {
+	km := NewKeyManagerWithConfig([]string{"key0", "key1"}, 5*time.Minute, "fill_first", 2*time.Hour, 5*time.Minute, 95.0)
+
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 50}, Rolling: UsageWindow{Percent: 50}}, "")
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 10}, Rolling: UsageWindow{Percent: 10}}, "")
+
+	// Even though key1 has lower weekly usage, fill_first fills key0 first until saturated
+	idx, _, _ := km.KeyForRequest("")
+	if idx != 0 {
+		t.Fatalf("expected fill_first to use key0, got %d", idx)
+	}
+
+	// When key0 hits >= 95% rolling, fill_first moves to key1
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 50}, Rolling: UsageWindow{Percent: 96}}, "")
+	idx, _, _ = km.KeyForRequest("")
+	if idx != 1 {
+		t.Fatalf("expected fill_first to move to key1 when key0 saturated, got %d", idx)
+	}
+}
+
+func TestDynamicResetsAtCooldownAndRecovery(t *testing.T) {
+	fakeTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	km := NewKeyManagerWithConfig([]string{"key0", "key1"}, 5*time.Minute, "session_sticky", 2*time.Hour, 5*time.Minute, 95.0)
+	km.now = func() time.Time { return fakeTime }
+
+	resetTime := fakeTime.Add(30 * time.Minute)
+	km.UpdateUsage(0, &KeyUsage{Rolling: UsageWindow{Percent: 99, ResetsAt: resetTime}}, "")
+	km.MarkExhausted(0)
+
+	// Key0 is exhausted and resetTime is in 30 minutes
+	st := km.Status()
+	if st.Keys[0].Eligible {
+		t.Fatalf("expected key0 to not be eligible")
+	}
+	if st.Keys[0].RetryAfterSeconds != 1800 {
+		t.Fatalf("expected 1800 seconds (30m) retry after, got %d", st.Keys[0].RetryAfterSeconds)
+	}
+
+	// Advance time past reset time (31 minutes)
+	fakeTime = fakeTime.Add(31 * time.Minute)
+
+	// Status should now show key0 is eligible for probe
+	st = km.Status()
+	if !st.Keys[0].Eligible {
+		t.Fatalf("expected key0 to be eligible after resetTime reached")
+	}
+
+	// New usage check reports rolling usage has cleared to 10%
+	km.UpdateUsage(0, &KeyUsage{Rolling: UsageWindow{Percent: 10, ResetsAt: fakeTime.Add(5 * time.Hour)}}, "")
+	st = km.Status()
+	if st.Keys[0].State != string(KeyAvailable) {
+		t.Fatalf("expected key0 state to automatically recover to available, got %s", st.Keys[0].State)
+	}
+}
+
+func TestAggregatedUsageEndpoint(t *testing.T) {
+	reset0 := time.Date(2026, 9, 1, 14, 0, 0, 0, time.UTC)
+	reset1 := time.Date(2026, 9, 1, 16, 0, 0, 0, time.UTC)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/usage" {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Header.Get("Authorization") == "Bearer key0" {
+				_, _ = w.Write([]byte(`{"rolling":{"status":"ok","percent":40.0,"resetsAt":"2026-09-01T14:00:00Z"},"weekly":{"status":"ok","percent":20.0},"monthly":{"status":"ok","percent":10.0}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"rolling":{"status":"ok","percent":60.0,"resetsAt":"2026-09-01T16:00:00Z"},"weekly":{"status":"ok","percent":30.0},"monthly":{"status":"ok","percent":15.0}}`))
+			}
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:              "test-proxy-key",
+		UpstreamAPIKeys:          []string{"key0", "key1"},
+		UpstreamBaseURL:          upstream.URL,
+		MaxRequestBodyBytes:      1024,
+		DisableUsagePolling:      true,
+		RoutingStrategy:          "session_sticky",
+		ProactiveSwitchThreshold: 95.0,
+	}
+	app := newApp(cfg)
+
+	// 1. Unauthenticated request should fail with 401
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/usage", nil)
+	recUnauth := httptest.NewRecorder()
+	app.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 unauth, got %d", recUnauth.Code)
+	}
+
+	// 2. Authenticated request with refresh=true
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage?refresh=true", nil)
+	req.Header.Set("Authorization", "Bearer test-proxy-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d body %s", rec.Code, rec.Body.String())
+	}
+
+	var resp AggregatedUsageResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Verify standard OpenCode top-level pooled metrics
+	if resp.Rolling.Percent != 50.0 { // (40 + 60) / 2
+		t.Fatalf("expected pooled rolling 50.0%%, got %f", resp.Rolling.Percent)
+	}
+	if resp.Weekly.Percent != 25.0 { // (20 + 30) / 2
+		t.Fatalf("expected pooled weekly 25.0%%, got %f", resp.Weekly.Percent)
+	}
+	if resp.Monthly.Percent != 12.5 { // (10 + 15) / 2
+		t.Fatalf("expected pooled monthly 12.5%%, got %f", resp.Monthly.Percent)
+	}
+	if !resp.Rolling.ResetsAt.Equal(reset0) {
+		t.Fatalf("expected earliest reset time %v, got %v", reset0, resp.Rolling.ResetsAt)
+	}
+	if !resp.Keys[1].Rolling.ResetsAt.Equal(reset1) {
+		t.Fatalf("expected key 1 reset time %v, got %v", reset1, resp.Keys[1].Rolling.ResetsAt)
+	}
+
+	// Verify multi-subscription summary & telemetry
+	if resp.Summary.TotalKeys != 2 || resp.Summary.AvailableKeys != 2 {
+		t.Fatalf("unexpected summary: %+v", resp.Summary)
+	}
+	if len(resp.Keys) != 2 {
+		t.Fatalf("expected 2 keys telemetry, got %d", len(resp.Keys))
+	}
+	if resp.Keys[0].Rolling.Percent != 40.0 || resp.Keys[1].Rolling.Percent != 60.0 {
+		t.Fatalf("unexpected per key rolling usage: %+v", resp.Keys)
+	}
+	if resp.Summary.PoolUsage.Rolling.TotalRemainingPercent != 100.0 { // 200 total - 100 used = 100 remaining
+		t.Fatalf("expected 100%% total remaining rolling quota, got %f", resp.Summary.PoolUsage.Rolling.TotalRemainingPercent)
+	}
+}
+
+func TestUsagePoller(t *testing.T) {
+	var pollCount int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/usage" {
+			atomic.AddInt32(&pollCount, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rolling":{"status":"ok","percent":25.0}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "p",
+		UpstreamAPIKeys:     []string{"k1"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024,
+		UsageCheckInterval:  20 * time.Millisecond,
+		DisableUsagePolling: false,
+	}
+	app := newApp(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	app.startUsagePoller(ctx)
+
+	// Wait briefly for at least 2 poll ticks
+	time.Sleep(70 * time.Millisecond)
+	cancel()
+
+	cnt := atomic.LoadInt32(&pollCount)
+	if cnt < 2 {
+		t.Fatalf("expected at least 2 polls, got %d", cnt)
+	}
+
+	st := app.keys.GetAggregatedUsage()
+	if st.Rolling.Percent != 25.0 {
+		t.Fatalf("expected rolling percent 25.0 updated by poller, got %f", st.Rolling.Percent)
+	}
+}
+
+func TestConcurrentLoadAndRace(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/usage" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rolling":{"status":"ok","percent":30.0}}`))
+			return
+		}
+		if r.URL.Path == "/chat/completions" || r.URL.Path == "/messages" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:              "test-key",
+		UpstreamAPIKeys:          []string{"k1", "k2", "k3", "k4"},
+		UpstreamBaseURL:          upstream.URL,
+		MaxRequestBodyBytes:      1024 * 1024,
+		RoutingStrategy:          "session_sticky",
+		UsageCheckInterval:       10 * time.Millisecond,
+		ProactiveSwitchThreshold: 95.0,
+	}
+	app := newApp(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.startUsagePoller(ctx)
+
+	var wg sync.WaitGroup
+	workers := 25
+	requestsPerWorker := 20
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < requestsPerWorker; j++ {
+				// Mix of chat completions, usage queries, and status queries
+				if j%3 == 0 {
+					req := httptest.NewRequest(http.MethodGet, "/usage", nil)
+					req.Header.Set("Authorization", "Bearer test-key")
+					rec := httptest.NewRecorder()
+					app.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("worker %d: /usage failed with %d", workerID, rec.Code)
+					}
+				} else {
+					body := []byte(`{"model":"gpt-4o","user":"user-` + string(rune('A'+workerID)) + `","messages":[{"role":"user","content":"test"}]}`)
+					req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+					req.Header.Set("Authorization", "Bearer test-key")
+					rec := httptest.NewRecorder()
+					app.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("worker %d: /chat/completions failed with %d", workerID, rec.Code)
+					}
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestSSEFlushing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: chunk1\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("data: chunk2\n\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "test-key",
+		UpstreamAPIKeys:     []string{"k1"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024,
+		DisableUsagePolling: true,
+	}
+	app := newApp(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "data: chunk1") || !strings.Contains(rec.Body.String(), "data: chunk2") {
+		t.Fatalf("expected chunks in response, got %s", rec.Body.String())
 	}
 }

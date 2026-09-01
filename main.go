@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,11 +35,15 @@ type Config struct {
 	UpstreamAPIKeys     []string
 	MaxRequestBodyBytes int64
 	// RetryExhaustedAfter is how long a key stays exhausted before it becomes
-	// eligible for an automatic retry probe. Zero disables the cooldown so
-	// exhausted keys are retried on the very next request (client backoff is the
-	// only pacing).
-	RetryExhaustedAfter time.Duration
-	ConfigSourcePath    string
+	// eligible for an automatic retry probe if upstream reset time is unknown.
+	RetryExhaustedAfter      time.Duration
+	RoutingStrategy          string
+	SessionTTL               time.Duration
+	BalancedIdleTimeout      time.Duration
+	UsageCheckInterval       time.Duration
+	ProactiveSwitchThreshold float64
+	DisableUsagePolling      bool
+	ConfigSourcePath         string
 
 	SMTP SMTPConfig
 }
@@ -77,7 +83,19 @@ func loadConfig() (Config, error) {
 }
 
 func defaultConfig() Config {
-	return Config{ListenAddr: ":8080", UpstreamBaseURL: "https://opencode.ai/zen/go/v1", MaxRequestBodyBytes: 20 << 20, RetryExhaustedAfter: 5 * time.Minute, SMTP: SMTPConfig{Port: 25}}
+	return Config{
+		ListenAddr:               ":8080",
+		UpstreamBaseURL:          "https://opencode.ai/zen/go/v1",
+		MaxRequestBodyBytes:      20 << 20,
+		RetryExhaustedAfter:      5 * time.Minute,
+		RoutingStrategy:          "session_sticky",
+		SessionTTL:               2 * time.Hour,
+		BalancedIdleTimeout:      1 * time.Hour,
+		UsageCheckInterval:       30 * time.Second,
+		ProactiveSwitchThreshold: 95.0,
+		DisableUsagePolling:      false,
+		SMTP:                     SMTPConfig{Port: 25},
+	}
 }
 
 func resolveConfigPath() (string, bool, error) {
@@ -107,9 +125,15 @@ type yamlConfig struct {
 		ProxyAPIKey string `yaml:"proxy_api_key"`
 	} `yaml:"server"`
 	Upstream struct {
-		BaseURL             string   `yaml:"base_url"`
-		APIKeys             []string `yaml:"api_keys"`
-		RetryExhaustedAfter string   `yaml:"retry_exhausted_after"`
+		BaseURL                  string   `yaml:"base_url"`
+		APIKeys                  []string `yaml:"api_keys"`
+		RetryExhaustedAfter      string   `yaml:"retry_exhausted_after"`
+		RoutingStrategy          string   `yaml:"routing_strategy"`
+		SessionTTL               string   `yaml:"session_ttl"`
+		BalancedIdleTimeout      string   `yaml:"balanced_idle_timeout"`
+		UsageCheckInterval       string   `yaml:"usage_check_interval"`
+		ProactiveSwitchThreshold *float64 `yaml:"proactive_switch_threshold"`
+		DisableUsagePolling      *bool    `yaml:"disable_usage_polling"`
 	} `yaml:"upstream"`
 	SMTP struct {
 		Host     string `yaml:"host"`
@@ -135,8 +159,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(b, &yc); err != nil {
 		return Config{}, fmt.Errorf("parse config file: %w", err)
 	}
-	// -1 marks "not present in file" so mergeConfig can tell an explicit 0
-	// (disable cooldown) apart from an omitted value (keep the default).
+
 	retry := time.Duration(-1)
 	if s := strings.TrimSpace(yc.Upstream.RetryExhaustedAfter); s != "" {
 		d, err := time.ParseDuration(s)
@@ -148,7 +171,77 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		retry = d
 	}
-	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+
+	sessionTTL := time.Duration(-1)
+	if s := strings.TrimSpace(yc.Upstream.SessionTTL); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse session_ttl: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("session_ttl must be >= 0")
+		}
+		sessionTTL = d
+	}
+
+	balancedIdle := time.Duration(-1)
+	if s := strings.TrimSpace(yc.Upstream.BalancedIdleTimeout); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse balanced_idle_timeout: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("balanced_idle_timeout must be >= 0")
+		}
+		balancedIdle = d
+	}
+
+	usageInterval := time.Duration(-1)
+	if s := strings.TrimSpace(yc.Upstream.UsageCheckInterval); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse usage_check_interval: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("usage_check_interval must be >= 0")
+		}
+		usageInterval = d
+	}
+
+	proactiveThreshold := -1.0
+	if yc.Upstream.ProactiveSwitchThreshold != nil {
+		proactiveThreshold = *yc.Upstream.ProactiveSwitchThreshold
+	}
+
+	disablePolling := false
+	if yc.Upstream.DisableUsagePolling != nil {
+		disablePolling = *yc.Upstream.DisableUsagePolling
+	}
+
+	return Config{
+		ListenAddr:               yc.Server.ListenAddr,
+		UpstreamBaseURL:          yc.Upstream.BaseURL,
+		ProxyAPIKey:              yc.Server.ProxyAPIKey,
+		UpstreamAPIKeys:          yc.Upstream.APIKeys,
+		MaxRequestBodyBytes:      yc.Limits.MaxRequestBodyBytes,
+		RetryExhaustedAfter:      retry,
+		RoutingStrategy:          yc.Upstream.RoutingStrategy,
+		SessionTTL:               sessionTTL,
+		BalancedIdleTimeout:      balancedIdle,
+		UsageCheckInterval:       usageInterval,
+		ProactiveSwitchThreshold: proactiveThreshold,
+		DisableUsagePolling:      disablePolling,
+		SMTP: SMTPConfig{
+			Host:     yc.SMTP.Host,
+			Port:     yc.SMTP.Port,
+			Username: yc.SMTP.Username,
+			Password: yc.SMTP.Password,
+			From:     yc.SMTP.From,
+			To:       yc.SMTP.To,
+			TLS:      yc.SMTP.TLS,
+			StartTLS: yc.SMTP.StartTLS,
+		},
+	}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -170,6 +263,22 @@ func mergeConfig(dst *Config, src Config) {
 	if src.RetryExhaustedAfter >= 0 {
 		dst.RetryExhaustedAfter = src.RetryExhaustedAfter
 	}
+	if src.RoutingStrategy != "" {
+		dst.RoutingStrategy = src.RoutingStrategy
+	}
+	if src.SessionTTL >= 0 {
+		dst.SessionTTL = src.SessionTTL
+	}
+	if src.BalancedIdleTimeout >= 0 {
+		dst.BalancedIdleTimeout = src.BalancedIdleTimeout
+	}
+	if src.UsageCheckInterval >= 0 {
+		dst.UsageCheckInterval = src.UsageCheckInterval
+	}
+	if src.ProactiveSwitchThreshold >= 0 {
+		dst.ProactiveSwitchThreshold = src.ProactiveSwitchThreshold
+	}
+	dst.DisableUsagePolling = src.DisableUsagePolling || dst.DisableUsagePolling
 	if src.SMTP.Host != "" {
 		dst.SMTP.Host = src.SMTP.Host
 	}
@@ -222,10 +331,42 @@ func applyEnvOverrides(cfg *Config) {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
 			cfg.RetryExhaustedAfter = d
 		} else {
-			// Preserve an invalid sentinel so validateConfig reports the typo
-			// instead of silently retaining a different YAML/default value.
 			cfg.RetryExhaustedAfter = -1
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ROUTING_STRATEGY")); v != "" {
+		cfg.RoutingStrategy = v
+	}
+	if v := strings.TrimSpace(os.Getenv("SESSION_TTL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cfg.SessionTTL = d
+		} else {
+			cfg.SessionTTL = -1
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("BALANCED_IDLE_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cfg.BalancedIdleTimeout = d
+		} else {
+			cfg.BalancedIdleTimeout = -1
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("USAGE_CHECK_INTERVAL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cfg.UsageCheckInterval = d
+		} else {
+			cfg.UsageCheckInterval = -1
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("PROACTIVE_SWITCH_THRESHOLD")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
+			cfg.ProactiveSwitchThreshold = f
+		} else {
+			cfg.ProactiveSwitchThreshold = -1
+		}
+	}
+	if v := os.Getenv("DISABLE_USAGE_POLLING"); v != "" {
+		cfg.DisableUsagePolling = parseBool(v)
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {
 		cfg.SMTP.Host = v
@@ -278,11 +419,29 @@ func validateConfig(cfg Config) error {
 	if cfg.RetryExhaustedAfter < 0 {
 		return errors.New("RETRY_EXHAUSTED_AFTER must be >= 0")
 	}
+	if cfg.SessionTTL < 0 {
+		return errors.New("SESSION_TTL must be >= 0")
+	}
+	if cfg.BalancedIdleTimeout < 0 {
+		return errors.New("BALANCED_IDLE_TIMEOUT must be >= 0")
+	}
+	if cfg.UsageCheckInterval < 0 {
+		return errors.New("USAGE_CHECK_INTERVAL must be >= 0")
+	}
+	if cfg.ProactiveSwitchThreshold < 0 || cfg.ProactiveSwitchThreshold > 100 {
+		return errors.New("PROACTIVE_SWITCH_THRESHOLD must be between 0 and 100")
+	}
+	strategy := strings.ToLower(strings.TrimSpace(cfg.RoutingStrategy))
+	if strategy != "" && strategy != "session_sticky" && strategy != "balanced" && strategy != "round_robin" && strategy != "fill_first" {
+		return fmt.Errorf("invalid ROUTING_STRATEGY: %q (must be one of: session_sticky, balanced, round_robin, fill_first)", cfg.RoutingStrategy)
+	}
 	return nil
 }
 
 func safeConfigSummary(cfg Config) string {
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
+	strategy := defaultString(cfg.RoutingStrategy, "session_sticky")
+	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d strategy=%s session_ttl=%s balanced_idle_timeout=%s usage_check_interval=%s proactive_threshold=%.1f%% polling_disabled=%t smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s",
+		cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), strategy, cfg.SessionTTL, cfg.BalancedIdleTimeout, cfg.UsageCheckInterval, cfg.ProactiveSwitchThreshold, cfg.DisableUsagePolling, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
@@ -295,58 +454,500 @@ const (
 	KeyExhausted KeyState = "exhausted"
 )
 
+// UsageWindow represents a usage quota bucket (rolling, weekly, monthly).
+type UsageWindow struct {
+	Status   string    `json:"status"`
+	Percent  float64   `json:"percent"`
+	ResetsAt time.Time `json:"resetsAt"`
+}
+
+// KeyUsage represents complete multi-window quota usage for an API key.
+type KeyUsage struct {
+	Rolling UsageWindow `json:"rolling"`
+	Weekly  UsageWindow `json:"weekly"`
+	Monthly UsageWindow `json:"monthly"`
+}
+
+func parseUpstreamUsage(body []byte, now time.Time) (KeyUsage, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return KeyUsage{}, err
+	}
+	if u, ok := raw["usage"].(map[string]any); ok {
+		raw = u
+	}
+	return KeyUsage{
+		Rolling: parseUsageWindow(raw["rolling"], now),
+		Weekly:  parseUsageWindow(raw["weekly"], now),
+		Monthly: parseUsageWindow(raw["monthly"], now),
+	}, nil
+}
+
+func parseUsageWindow(v any, now time.Time) UsageWindow {
+	m, ok := v.(map[string]any)
+	if !ok || m == nil {
+		return UsageWindow{Status: "ok", Percent: 0}
+	}
+	w := UsageWindow{Status: "ok"}
+	if st, ok := m["status"].(string); ok && st != "" {
+		w.Status = st
+	}
+	switch p := m["percent"].(type) {
+	case float64:
+		w.Percent = p
+	case int:
+		w.Percent = float64(p)
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(p), 64); err == nil {
+			w.Percent = f
+		}
+	}
+	w.ResetsAt = parseResetTime(m, now)
+	return w
+}
+
+func parseResetTime(m map[string]any, now time.Time) time.Time {
+	for _, key := range []string{"resetsAt", "resets_at", "reset_at", "resetAt"} {
+		if val, ok := m[key]; ok && val != nil {
+			switch v := val.(type) {
+			case string:
+				v = strings.TrimSpace(v)
+				for _, layout := range []string{
+					time.RFC3339Nano,
+					time.RFC3339,
+					"2006-01-02T15:04:05Z07:00",
+					"2006-01-02T15:04:05.000Z",
+					"2006-01-02T15:04:05",
+					"2006-01-02 15:04:05",
+				} {
+					if t, err := time.Parse(layout, v); err == nil {
+						return t.UTC()
+					}
+				}
+			case float64:
+				if v > 1e11 {
+					return time.UnixMilli(int64(v)).UTC()
+				} else if v > 1e8 {
+					return time.Unix(int64(v), 0).UTC()
+				}
+			case int:
+				if v > 1e8 {
+					return time.Unix(int64(v), 0).UTC()
+				}
+			}
+		}
+	}
+	for _, key := range []string{"resetsInSeconds", "resets_in_seconds", "reset_in_seconds"} {
+		if val, ok := m[key]; ok && val != nil {
+			switch v := val.(type) {
+			case float64:
+				if v > 0 {
+					return now.Add(time.Duration(v) * time.Second).UTC()
+				}
+			case int:
+				if v > 0 {
+					return now.Add(time.Duration(v) * time.Second).UTC()
+				}
+			case string:
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f > 0 {
+					return now.Add(time.Duration(f) * time.Second).UTC()
+				}
+			}
+		}
+	}
+	return time.Time{}
+}
+
+type sessionEntry struct {
+	keyIndex   int
+	lastActive time.Time
+}
+
+type SessionManager struct {
+	mu       sync.Mutex
+	sessions map[string]sessionEntry
+	ttl      time.Duration
+	now      func() time.Time
+}
+
+func NewSessionManager(ttl time.Duration) *SessionManager {
+	if ttl <= 0 {
+		ttl = 2 * time.Hour
+	}
+	return &SessionManager{
+		sessions: make(map[string]sessionEntry),
+		ttl:      ttl,
+		now:      func() time.Time { return time.Now().UTC() },
+	}
+}
+
+func (sm *SessionManager) GetKey(sessionID string) (int, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sessionID == "" {
+		return 0, false
+	}
+	entry, ok := sm.sessions[sessionID]
+	if !ok {
+		return 0, false
+	}
+	if sm.now().Sub(entry.lastActive) > sm.ttl {
+		delete(sm.sessions, sessionID)
+		return 0, false
+	}
+	entry.lastActive = sm.now()
+	sm.sessions[sessionID] = entry
+	return entry.keyIndex, true
+}
+
+func (sm *SessionManager) SetKey(sessionID string, keyIndex int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sessionID == "" {
+		return
+	}
+	sm.sessions[sessionID] = sessionEntry{
+		keyIndex:   keyIndex,
+		lastActive: sm.now(),
+	}
+}
+
+func (sm *SessionManager) InvalidateKey(keyIndex int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for sid, entry := range sm.sessions {
+		if entry.keyIndex == keyIndex {
+			delete(sm.sessions, sid)
+		}
+	}
+}
+
+func (sm *SessionManager) ActiveCount() int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	count := 0
+	now := sm.now()
+	for sid, entry := range sm.sessions {
+		if now.Sub(entry.lastActive) <= sm.ttl {
+			count++
+		} else {
+			delete(sm.sessions, sid)
+		}
+	}
+	return count
+}
+
+func (sm *SessionManager) CleanupExpired() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	now := sm.now()
+	for sid, entry := range sm.sessions {
+		if now.Sub(entry.lastActive) > sm.ttl {
+			delete(sm.sessions, sid)
+		}
+	}
+}
+
+func extractSessionID(r *http.Request, body []byte) string {
+	for _, h := range []string{
+		"x-session-id",
+		"session-id",
+		"x-conversation-id",
+		"conversation-id",
+		"x-agent-session",
+	} {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v
+		}
+	}
+
+	if len(body) > 0 {
+		var raw map[string]any
+		if json.Unmarshal(body, &raw) == nil {
+			for _, f := range []string{"user", "prompt_cache_key", "session_id", "conversation_id"} {
+				if s, ok := raw[f].(string); ok && strings.TrimSpace(s) != "" {
+					return strings.TrimSpace(s)
+				}
+			}
+			if msgs, ok := raw["messages"].([]any); ok && len(msgs) > 0 {
+				if first, ok := msgs[0].(map[string]any); ok {
+					var text string
+					if content, ok := first["content"].(string); ok {
+						text = content
+					} else if contentArr, ok := first["content"].([]any); ok && len(contentArr) > 0 {
+						if contentObj, ok := contentArr[0].(map[string]any); ok {
+							if txt, ok := contentObj["text"].(string); ok {
+								text = txt
+							}
+						}
+					}
+					if len(text) > 0 {
+						if len(text) > 512 {
+							text = text[:512]
+						}
+						h := sha256.Sum256([]byte(text))
+						return "conv_" + hex.EncodeToString(h[:8])
+					}
+				}
+			} else if prompt, ok := raw["prompt"].(string); ok && len(prompt) > 0 {
+				if len(prompt) > 512 {
+					prompt = prompt[:512]
+				}
+				h := sha256.Sum256([]byte(prompt))
+				return "prompt_" + hex.EncodeToString(h[:8])
+			} else if system, ok := raw["system"].(string); ok && len(system) > 0 {
+				if len(system) > 512 {
+					system = system[:512]
+				}
+				h := sha256.Sum256([]byte(system))
+				return "system_" + hex.EncodeToString(h[:8])
+			}
+		}
+	}
+	return ""
+}
+
 type KeyManager struct {
-	mu             sync.Mutex
-	keys           []string
-	states         []KeyState
-	last429        map[int]time.Time
-	current        int
-	allNotified    bool
-	notifiedSwitch map[int]bool
-	// cooldown is how long an exhausted key waits before it becomes eligible for
-	// an automatic retry. Zero means exhausted keys are immediately eligible
-	// again (retry on the next request).
-	cooldown time.Duration
-	// now is injectable so tests can drive the cooldown with a fake clock.
-	now func() time.Time
+	mu                  sync.Mutex
+	keys                []string
+	states              []KeyState
+	last429             map[int]time.Time
+	resetTimes          map[int]time.Time
+	usageData           map[int]*KeyUsage
+	lastUsageCheck      map[int]time.Time
+	usageErrors         map[int]string
+	current             int
+	roundRobinIndex     int
+	allNotified         bool
+	notifiedSwitch      map[int]bool
+	cooldown            time.Duration
+	routingStrategy     string
+	proactiveThreshold  float64
+	balancedIdleTimeout time.Duration
+	lastGlobalRequest   time.Time
+	sessionMgr          *SessionManager
+	now                 func() time.Time
 }
 
 func NewKeyManager(keys []string, cooldown time.Duration) *KeyManager {
+	return NewKeyManagerWithConfig(keys, cooldown, "session_sticky", 2*time.Hour, 1*time.Hour, 95.0)
+}
+
+func NewKeyManagerWithConfig(keys []string, cooldown time.Duration, strategy string, sessionTTL, balancedIdle time.Duration, proactiveThreshold float64) *KeyManager {
 	states := make([]KeyState, len(keys))
 	for i := range states {
 		states[i] = KeyUnknown
 	}
-	return &KeyManager{keys: append([]string(nil), keys...), states: states, last429: map[int]time.Time{}, notifiedSwitch: map[int]bool{}, cooldown: cooldown, now: func() time.Time { return time.Now().UTC() }}
+	if strategy == "" {
+		strategy = "session_sticky"
+	}
+	if proactiveThreshold <= 0 {
+		proactiveThreshold = 95.0
+	}
+	if balancedIdle <= 0 {
+		balancedIdle = 1 * time.Hour
+	}
+	if sessionTTL <= 0 {
+		sessionTTL = 2 * time.Hour
+	}
+	return &KeyManager{
+		keys:                append([]string(nil), keys...),
+		states:              states,
+		last429:             map[int]time.Time{},
+		resetTimes:          map[int]time.Time{},
+		usageData:           map[int]*KeyUsage{},
+		lastUsageCheck:      map[int]time.Time{},
+		usageErrors:         map[int]string{},
+		notifiedSwitch:      map[int]bool{},
+		cooldown:            cooldown,
+		routingStrategy:     strategy,
+		proactiveThreshold:  proactiveThreshold,
+		balancedIdleTimeout: balancedIdle,
+		sessionMgr:          NewSessionManager(sessionTTL),
+		now:                 func() time.Time { return time.Now().UTC() },
+	}
 }
 
-// eligibleLocked reports whether key i may be handed out right now. A key that is
-// not exhausted is always eligible; an exhausted key becomes eligible again once
-// its cooldown has elapsed since the last quota error (so the next real request
-// acts as a probe).
 func (m *KeyManager) eligibleLocked(i int) bool {
+	if i < 0 || i >= len(m.keys) {
+		return false
+	}
 	if m.states[i] != KeyExhausted {
 		return true
 	}
-	t, ok := m.last429[i]
-	if !ok {
-		return true
+	if t, ok := m.resetTimes[i]; ok && !t.IsZero() {
+		return !m.now().Before(t)
 	}
-	return !m.now().Before(t.Add(m.cooldown))
+	if t, ok := m.last429[i]; ok {
+		return !m.now().Before(t.Add(m.cooldown))
+	}
+	return true
 }
 
-func (m *KeyManager) Current() (int, string, bool) {
+func (m *KeyManager) isProactivelySaturatedLocked(i int) bool {
+	if u, ok := m.usageData[i]; ok && u != nil {
+		return u.Rolling.Percent >= m.proactiveThreshold
+	}
+	return false
+}
+
+func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
+	if len(m.keys) == 0 {
+		return 0, false
+	}
+
+	type candidate struct {
+		index   int
+		weekly  float64
+		monthly float64
+		rolling float64
+	}
+
+	var healthy []candidate
+	var saturated []candidate
+	var exhausted []candidate
+
+	for i := range m.keys {
+		if exclude != nil && exclude[i] {
+			continue
+		}
+		if !m.eligibleLocked(i) {
+			continue
+		}
+		c := candidate{index: i}
+		if u, ok := m.usageData[i]; ok && u != nil {
+			c.weekly = u.Weekly.Percent
+			c.monthly = u.Monthly.Percent
+			c.rolling = u.Rolling.Percent
+		}
+		if m.states[i] == KeyExhausted {
+			exhausted = append(exhausted, c)
+		} else if m.isProactivelySaturatedLocked(i) {
+			saturated = append(saturated, c)
+		} else {
+			healthy = append(healthy, c)
+		}
+	}
+
+	pool := healthy
+	if len(pool) == 0 {
+		pool = saturated
+	}
+	if len(pool) == 0 {
+		pool = exhausted
+	}
+	if len(pool) == 0 {
+		return 0, false
+	}
+
+	best := pool[0]
+	for _, c := range pool[1:] {
+		if c.weekly < best.weekly {
+			best = c
+		} else if c.weekly == best.weekly {
+			if c.monthly < best.monthly {
+				best = c
+			} else if c.monthly == best.monthly {
+				if c.rolling < best.rolling {
+					best = c
+				}
+			}
+		}
+	}
+	return best.index, true
+}
+
+func (m *KeyManager) KeyForRequest(sessionID string, exclude ...map[int]bool) (int, string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.keys) == 0 {
 		return 0, "", false
 	}
-	if !m.eligibleLocked(m.current) {
-		m.advanceLocked()
+
+	var tried map[int]bool
+	if len(exclude) > 0 && exclude[0] != nil {
+		tried = exclude[0]
 	}
-	if !m.eligibleLocked(m.current) {
+
+	now := m.now()
+	idleGap := now.Sub(m.lastGlobalRequest)
+	m.lastGlobalRequest = now
+
+	switch m.routingStrategy {
+	case "session_sticky":
+		if sessionID != "" && m.sessionMgr != nil {
+			if k, ok := m.sessionMgr.GetKey(sessionID); ok {
+				if (tried == nil || !tried[k]) && m.eligibleLocked(k) && !m.isProactivelySaturatedLocked(k) && m.states[k] != KeyExhausted {
+					m.current = k
+					return k, m.keys[k], true
+				}
+			}
+		}
+		best, ok := m.bestKeyByQuotaLocked(tried)
+		if !ok {
+			return 0, "", false
+		}
+		if sessionID != "" && m.sessionMgr != nil {
+			m.sessionMgr.SetKey(sessionID, best)
+		}
+		m.current = best
+		return best, m.keys[best], true
+
+	case "balanced":
+		if m.lastGlobalRequest.IsZero() || idleGap > m.balancedIdleTimeout || !m.eligibleLocked(m.current) || m.isProactivelySaturatedLocked(m.current) || m.states[m.current] == KeyExhausted || (tried != nil && tried[m.current]) {
+			if best, ok := m.bestKeyByQuotaLocked(tried); ok {
+				m.current = best
+			}
+		}
+		if (tried == nil || !tried[m.current]) && m.eligibleLocked(m.current) {
+			return m.current, m.keys[m.current], true
+		}
+		if best, ok := m.bestKeyByQuotaLocked(tried); ok {
+			m.current = best
+			return best, m.keys[best], true
+		}
+		return 0, "", false
+
+	case "round_robin":
+		for step := 0; step < len(m.keys); step++ {
+			next := (m.roundRobinIndex + step) % len(m.keys)
+			if (tried == nil || !tried[next]) && m.eligibleLocked(next) && !m.isProactivelySaturatedLocked(next) && m.states[next] != KeyExhausted {
+				m.roundRobinIndex = (next + 1) % len(m.keys)
+				m.current = next
+				return next, m.keys[next], true
+			}
+		}
+		for step := 0; step < len(m.keys); step++ {
+			next := (m.roundRobinIndex + step) % len(m.keys)
+			if (tried == nil || !tried[next]) && m.eligibleLocked(next) {
+				m.roundRobinIndex = (next + 1) % len(m.keys)
+				m.current = next
+				return next, m.keys[next], true
+			}
+		}
+		return 0, "", false
+
+	case "fill_first":
+		fallthrough
+	default:
+		for i := range m.keys {
+			if (tried == nil || !tried[i]) && m.eligibleLocked(i) && !m.isProactivelySaturatedLocked(i) && m.states[i] != KeyExhausted {
+				m.current = i
+				return i, m.keys[i], true
+			}
+		}
+		for i := range m.keys {
+			if (tried == nil || !tried[i]) && m.eligibleLocked(i) {
+				m.current = i
+				return i, m.keys[i], true
+			}
+		}
 		return 0, "", false
 	}
-	return m.current, m.keys[m.current], true
+}
+
+func (m *KeyManager) Current() (int, string, bool) {
+	return m.KeyForRequest("")
 }
 
 func (m *KeyManager) MarkExhausted(i int) {
@@ -357,6 +958,14 @@ func (m *KeyManager) MarkExhausted(i int) {
 	}
 	m.states[i] = KeyExhausted
 	m.last429[i] = m.now()
+	if m.resetTimes[i].IsZero() || m.now().After(m.resetTimes[i]) {
+		if m.cooldown > 0 {
+			m.resetTimes[i] = m.now().Add(m.cooldown)
+		}
+	}
+	if m.sessionMgr != nil {
+		m.sessionMgr.InvalidateKey(i)
+	}
 	m.advanceLocked()
 }
 
@@ -397,6 +1006,10 @@ func (m *KeyManager) advanceLocked() {
 	if len(m.keys) == 0 {
 		return
 	}
+	if best, ok := m.bestKeyByQuotaLocked(nil); ok {
+		m.current = best
+		return
+	}
 	start := m.current
 	for step := 1; step <= len(m.keys); step++ {
 		next := (start + step) % len(m.keys)
@@ -408,29 +1021,25 @@ func (m *KeyManager) advanceLocked() {
 	m.current = start
 }
 
-// RetryAfterSeconds returns the number of seconds until the soonest exhausted key
-// becomes eligible for a retry, for use as a Retry-After header on the local
-// all-exhausted 429. The second return value is false when a Retry-After hint is
-// not meaningful: the cooldown is disabled, or some key is already usable.
 func (m *KeyManager) RetryAfterSeconds() (int, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.cooldown <= 0 {
-		return 0, false
-	}
 	var soonest time.Time
 	found := false
 	for i := range m.keys {
 		if m.states[i] != KeyExhausted {
 			return 0, false
 		}
-		t, ok := m.last429[i]
-		if !ok {
+		var resetAt time.Time
+		if t, ok := m.resetTimes[i]; ok && !t.IsZero() {
+			resetAt = t
+		} else if t, ok := m.last429[i]; ok && m.cooldown > 0 {
+			resetAt = t.Add(m.cooldown)
+		} else {
 			return 0, false
 		}
-		eligibleAt := t.Add(m.cooldown)
-		if !found || eligibleAt.Before(soonest) {
-			soonest = eligibleAt
+		if !found || resetAt.Before(soonest) {
+			soonest = resetAt
 			found = true
 		}
 	}
@@ -471,9 +1080,15 @@ func (m *KeyManager) Status() StatusResponse {
 		}
 		eligible := m.eligibleLocked(i)
 		ps := PerKeyStatus{Index: i, State: string(display), Last429Time: m.last429String(i), Current: i == m.current, Eligible: eligible}
-		if state == KeyExhausted && m.cooldown > 0 && !eligible {
-			if t, ok := m.last429[i]; ok {
-				secs := int(math.Ceil(t.Add(m.cooldown).Sub(m.now()).Seconds()))
+		if state == KeyExhausted && !eligible {
+			var resetAt time.Time
+			if t, ok := m.resetTimes[i]; ok && !t.IsZero() {
+				resetAt = t
+			} else if t, ok := m.last429[i]; ok && m.cooldown > 0 {
+				resetAt = t.Add(m.cooldown)
+			}
+			if !resetAt.IsZero() {
+				secs := int(math.Ceil(resetAt.Sub(m.now()).Seconds()))
 				if secs < 0 {
 					secs = 0
 				}
@@ -482,7 +1097,12 @@ func (m *KeyManager) Status() StatusResponse {
 		}
 		states[i] = ps
 	}
-	return StatusResponse{CurrentKeyIndex: m.current, Keys: states, RetryExhaustedAfterSeconds: int(m.cooldown / time.Second), Note: "unknown means the key has not yet been validated or used since startup; an exhausted key becomes eligible for an automatic retry once retry_exhausted_after_seconds has elapsed since last_429_time (0 disables the cooldown); remaining usage is unavailable from opencode-go API."}
+	return StatusResponse{
+		CurrentKeyIndex:            m.current,
+		Keys:                       states,
+		RetryExhaustedAfterSeconds: int(m.cooldown / time.Second),
+		Note:                       "unknown means the key has not yet been validated or used since startup; an exhausted key becomes eligible for an automatic retry once retry_exhausted_after_seconds has elapsed since last_429_time or resetsAt is reached.",
+	}
 }
 
 func (m *KeyManager) SetState(i int, state KeyState) {
@@ -494,17 +1114,45 @@ func (m *KeyManager) SetState(i int, state KeyState) {
 	m.states[i] = state
 	if state == KeyExhausted {
 		m.last429[i] = m.now()
+		if m.resetTimes[i].IsZero() || m.now().After(m.resetTimes[i]) {
+			if m.cooldown > 0 {
+				m.resetTimes[i] = m.now().Add(m.cooldown)
+			}
+		}
+		if m.sessionMgr != nil {
+			m.sessionMgr.InvalidateKey(i)
+		}
 		return
 	}
-	// Recovery: the key is usable again. Drop its cooldown timestamp and re-arm
-	// the notification flags so a future depletion round alerts again instead of
-	// staying silent.
 	delete(m.last429, i)
+	delete(m.resetTimes, i)
 	m.notifiedSwitch[i] = false
 	m.allNotified = false
 }
 
 func (m *KeyManager) MarkAvailable(i int) { m.SetState(i, KeyAvailable) }
+
+func (m *KeyManager) UpdateUsage(i int, usage *KeyUsage, errStr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.keys) {
+		return
+	}
+	m.lastUsageCheck[i] = m.now()
+	m.usageErrors[i] = errStr
+	if usage != nil {
+		m.usageData[i] = usage
+		if !usage.Rolling.ResetsAt.IsZero() {
+			m.resetTimes[i] = usage.Rolling.ResetsAt
+		}
+		if m.states[i] == KeyExhausted && usage.Rolling.Percent < m.proactiveThreshold {
+			m.states[i] = KeyAvailable
+			delete(m.last429, i)
+			m.notifiedSwitch[i] = false
+			m.allNotified = false
+		}
+	}
+}
 
 func (m *KeyManager) last429String(i int) string {
 	if t, ok := m.last429[i]; ok && !t.IsZero() {
@@ -514,24 +1162,230 @@ func (m *KeyManager) last429String(i int) string {
 }
 
 type PerKeyStatus struct {
-	Index       int    `json:"index"`
-	State       string `json:"state"`
-	Last429Time string `json:"last_429_time,omitempty"`
-	Current     bool   `json:"current"`
-	// Eligible reports whether the key may be handed out on the next request. An
-	// exhausted key is eligible again once its cooldown has elapsed.
-	Eligible bool `json:"eligible"`
-	// RetryAfterSeconds is the remaining cooldown for an exhausted key that is not
-	// yet eligible. Omitted for eligible keys and when the cooldown is disabled.
-	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	Index             int    `json:"index"`
+	State             string `json:"state"`
+	Last429Time       string `json:"last_429_time,omitempty"`
+	Current           bool   `json:"current"`
+	Eligible          bool   `json:"eligible"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 }
+
 type StatusResponse struct {
-	CurrentKeyIndex int            `json:"current_key_index"`
-	Keys            []PerKeyStatus `json:"keys"`
-	// RetryExhaustedAfterSeconds is the configured cooldown before an exhausted
-	// key is retried automatically. Zero means the cooldown is disabled.
-	RetryExhaustedAfterSeconds int    `json:"retry_exhausted_after_seconds"`
-	Note                       string `json:"note"`
+	CurrentKeyIndex            int            `json:"current_key_index"`
+	Keys                       []PerKeyStatus `json:"keys"`
+	RetryExhaustedAfterSeconds int            `json:"retry_exhausted_after_seconds"`
+	Note                       string         `json:"note"`
+}
+
+type UsageSummaryPool struct {
+	Rolling SummaryWindow `json:"rolling"`
+	Weekly  SummaryWindow `json:"weekly"`
+	Monthly SummaryWindow `json:"monthly"`
+}
+
+type SummaryWindow struct {
+	AveragePercent        float64    `json:"average_percent"`
+	TotalRemainingPercent float64    `json:"total_remaining_percent"`
+	MinPercent            float64    `json:"min_percent"`
+	MaxPercent            float64    `json:"max_percent"`
+	EarliestResetAt       *time.Time `json:"earliest_reset_at,omitempty"`
+}
+
+type UsageSummary struct {
+	TotalKeys                 int               `json:"total_keys"`
+	AvailableKeys             int               `json:"available_keys"`
+	ExhaustedKeys             int               `json:"exhausted_keys"`
+	ActiveSessions            int               `json:"active_sessions"`
+	RoutingStrategy           string            `json:"routing_strategy"`
+	ProactiveThresholdPercent float64           `json:"proactive_threshold_percent"`
+	PoolUsage                 *UsageSummaryPool `json:"pool_usage,omitempty"`
+}
+
+type PerKeyUsage struct {
+	Index             int         `json:"index"`
+	State             string      `json:"state"`
+	Current           bool        `json:"current"`
+	Eligible          bool        `json:"eligible"`
+	RetryAfterSeconds int         `json:"retry_after_seconds,omitempty"`
+	Rolling           UsageWindow `json:"rolling"`
+	Weekly            UsageWindow `json:"weekly"`
+	Monthly           UsageWindow `json:"monthly"`
+	LastCheckedAt     string      `json:"last_checked_at,omitempty"`
+	Error             string      `json:"error,omitempty"`
+}
+
+type AggregatedUsageResponse struct {
+	Rolling UsageWindow   `json:"rolling"`
+	Weekly  UsageWindow   `json:"weekly"`
+	Monthly UsageWindow   `json:"monthly"`
+	Summary UsageSummary  `json:"summary"`
+	Keys    []PerKeyUsage `json:"keys"`
+}
+
+func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	n := len(m.keys)
+	keysList := make([]PerKeyUsage, n)
+
+	var totalRolling, totalWeekly, totalMonthly float64
+	minRolling, maxRolling := 100.0, 0.0
+	minWeekly, maxWeekly := 100.0, 0.0
+	minMonthly, maxMonthly := 100.0, 0.0
+	var earliestReset *time.Time
+
+	availableCount := 0
+	exhaustedCount := 0
+
+	var hasUsageData bool
+	for i := range m.keys {
+		state := m.states[i]
+		display := state
+		if i == m.current && state != KeyExhausted {
+			display = KeyAvailable
+		}
+		eligible := m.eligibleLocked(i)
+		if state == KeyExhausted {
+			exhaustedCount++
+		} else if eligible && !m.isProactivelySaturatedLocked(i) {
+			availableCount++
+		}
+
+		pku := PerKeyUsage{
+			Index:    i,
+			State:    string(display),
+			Current:  i == m.current,
+			Eligible: eligible,
+			Error:    m.usageErrors[i],
+		}
+
+		if t, ok := m.lastUsageCheck[i]; ok && !t.IsZero() {
+			pku.LastCheckedAt = t.Format(time.RFC3339)
+		}
+
+		if state == KeyExhausted && !eligible {
+			var resetAt time.Time
+			if t, ok := m.resetTimes[i]; ok && !t.IsZero() {
+				resetAt = t
+			} else if t, ok := m.last429[i]; ok && m.cooldown > 0 {
+				resetAt = t.Add(m.cooldown)
+			}
+			if !resetAt.IsZero() {
+				secs := int(math.Ceil(resetAt.Sub(m.now()).Seconds()))
+				if secs < 0 {
+					secs = 0
+				}
+				pku.RetryAfterSeconds = secs
+			}
+		}
+
+		if u, ok := m.usageData[i]; ok && u != nil {
+			hasUsageData = true
+			pku.Rolling = u.Rolling
+			pku.Weekly = u.Weekly
+			pku.Monthly = u.Monthly
+
+			totalRolling += u.Rolling.Percent
+			totalWeekly += u.Weekly.Percent
+			totalMonthly += u.Monthly.Percent
+
+			if u.Rolling.Percent < minRolling {
+				minRolling = u.Rolling.Percent
+			}
+			if u.Rolling.Percent > maxRolling {
+				maxRolling = u.Rolling.Percent
+			}
+
+			if u.Weekly.Percent < minWeekly {
+				minWeekly = u.Weekly.Percent
+			}
+			if u.Weekly.Percent > maxWeekly {
+				maxWeekly = u.Weekly.Percent
+			}
+
+			if u.Monthly.Percent < minMonthly {
+				minMonthly = u.Monthly.Percent
+			}
+			if u.Monthly.Percent > maxMonthly {
+				maxMonthly = u.Monthly.Percent
+			}
+
+			if !u.Rolling.ResetsAt.IsZero() {
+				if earliestReset == nil || u.Rolling.ResetsAt.Before(*earliestReset) {
+					t := u.Rolling.ResetsAt
+					earliestReset = &t
+				}
+			}
+		} else {
+			pku.Rolling = UsageWindow{Status: string(state)}
+			pku.Weekly = UsageWindow{Status: string(state)}
+			pku.Monthly = UsageWindow{Status: string(state)}
+		}
+
+		keysList[i] = pku
+	}
+
+	var avgRolling, avgWeekly, avgMonthly float64
+	if n > 0 && hasUsageData {
+		avgRolling = totalRolling / float64(n)
+		avgWeekly = totalWeekly / float64(n)
+		avgMonthly = totalMonthly / float64(n)
+	} else {
+		minRolling, minWeekly, minMonthly = 0, 0, 0
+	}
+
+	poolCapacity := float64(n) * 100.0
+
+	activeSessions := 0
+	if m.sessionMgr != nil {
+		activeSessions = m.sessionMgr.ActiveCount()
+	}
+
+	pool := &UsageSummaryPool{
+		Rolling: SummaryWindow{
+			AveragePercent:        avgRolling,
+			TotalRemainingPercent: poolCapacity - totalRolling,
+			MinPercent:            minRolling,
+			MaxPercent:            maxRolling,
+			EarliestResetAt:       earliestReset,
+		},
+		Weekly: SummaryWindow{
+			AveragePercent:        avgWeekly,
+			TotalRemainingPercent: poolCapacity - totalWeekly,
+			MinPercent:            minWeekly,
+			MaxPercent:            maxWeekly,
+		},
+		Monthly: SummaryWindow{
+			AveragePercent:        avgMonthly,
+			TotalRemainingPercent: poolCapacity - totalMonthly,
+			MinPercent:            minMonthly,
+			MaxPercent:            maxMonthly,
+		},
+	}
+
+	topRolling := UsageWindow{Status: "ok", Percent: avgRolling}
+	if earliestReset != nil {
+		topRolling.ResetsAt = *earliestReset
+	}
+	topWeekly := UsageWindow{Status: "ok", Percent: avgWeekly}
+	topMonthly := UsageWindow{Status: "ok", Percent: avgMonthly}
+
+	return AggregatedUsageResponse{
+		Rolling: topRolling,
+		Weekly:  topWeekly,
+		Monthly: topMonthly,
+		Summary: UsageSummary{
+			TotalKeys:                 n,
+			AvailableKeys:             availableCount,
+			ExhaustedKeys:             exhaustedCount,
+			ActiveSessions:            activeSessions,
+			RoutingStrategy:           m.routingStrategy,
+			ProactiveThresholdPercent: m.proactiveThreshold,
+			PoolUsage:                 pool,
+		},
+		Keys: keysList,
+	}
 }
 
 type ValidateKeyResult struct {
@@ -553,7 +1407,31 @@ type App struct {
 }
 
 func newApp(cfg Config) *App {
-	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP)}
+	km := NewKeyManagerWithConfig(
+		cfg.UpstreamAPIKeys,
+		cfg.RetryExhaustedAfter,
+		cfg.RoutingStrategy,
+		cfg.SessionTTL,
+		cfg.BalancedIdleTimeout,
+		cfg.ProactiveSwitchThreshold,
+	)
+	return &App{
+		config: cfg,
+		keys:   km,
+		client: &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ExpectContinueTimeout: 2 * time.Second,
+			},
+		},
+		sender: NewSMTPNotifier(cfg.SMTP),
+	}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -563,6 +1441,12 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	case r.URL.Path == "/readyz":
 		a.handleReadyz(w, r)
+	case r.URL.Path == "/usage" || r.URL.Path == "/v1/usage" || r.URL.Path == "/admin/usage":
+		if !a.authOK(r) {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
+			return
+		}
+		a.handleUsage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/"):
 		if !a.authOK(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
@@ -627,8 +1511,18 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleResetKey un-exhausts a single upstream key by index, without restarting
-// the proxy. Body: {"index": <int>}. Responds with the updated status.
+func (a *App) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.Query().Get("refresh") == "true" {
+		a.pollAllKeysUsage(r.Context())
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(a.keys.GetAggregatedUsage())
+}
+
 func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Index int `json:"index"`
@@ -646,7 +1540,6 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(a.keys.Status())
 }
 
-// handleResetAllKeys un-exhausts every upstream key, without restarting.
 func (a *App) handleResetAllKeys(w http.ResponseWriter, r *http.Request) {
 	for i := range a.config.UpstreamAPIKeys {
 		a.keys.MarkAvailable(i)
@@ -699,6 +1592,70 @@ func (a *App) checkUpstreamReady(ctx context.Context, key string) error {
 		return nil
 	}
 	return fmt.Errorf("upstream status %d", resp.StatusCode)
+}
+
+func (a *App) fetchUpstreamUsage(ctx context.Context, key string) (KeyUsage, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	u := strings.TrimRight(a.config.UpstreamBaseURL, "/") + "/usage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return KeyUsage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("User-Agent", "OpenAI/Python 1.0.0")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return KeyUsage{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return KeyUsage{}, fmt.Errorf("upstream /usage returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return KeyUsage{}, err
+	}
+	return parseUpstreamUsage(body, time.Now().UTC())
+}
+
+func (a *App) pollAllKeysUsage(ctx context.Context) {
+	for i, key := range a.config.UpstreamAPIKeys {
+		usage, err := a.fetchUpstreamUsage(ctx, key)
+		if err != nil {
+			a.keys.UpdateUsage(i, nil, err.Error())
+		} else {
+			a.keys.UpdateUsage(i, &usage, "")
+		}
+	}
+}
+
+func (a *App) startUsagePoller(ctx context.Context) {
+	if a.config.DisableUsagePolling || a.config.UsageCheckInterval <= 0 {
+		return
+	}
+	go a.pollAllKeysUsage(ctx)
+
+	ticker := time.NewTicker(a.config.UsageCheckInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if a.keys.sessionMgr != nil {
+					a.keys.sessionMgr.CleanupExpired()
+				}
+				a.pollAllKeysUsage(ctx)
+			}
+		}
+	}()
 }
 
 func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
@@ -763,11 +1720,16 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	}
 	_ = r.Body.Close()
 	orig := r.Context()
+
+	sessionID := extractSessionID(r, body)
+	tried := make(map[int]bool)
+
 	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
-		idx, key, ok := a.keys.Current()
+		idx, key, ok := a.keys.KeyForRequest(sessionID, tried)
 		if !ok {
 			break
 		}
+		tried[idx] = true
 		resp, reqErr := a.doUpstream(orig, r, body, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
@@ -864,7 +1826,16 @@ func copyHeaders(dst, src http.Header) {
 }
 
 func stripHopByHopHeaders(h http.Header) {
-	hop := map[string]struct{}{"Connection": {}, "Proxy-Authorization": {}, "Proxy-Authenticate": {}, "Keep-Alive": {}, "Te": {}, "Trailer": {}, "Transfer-Encoding": {}, "Upgrade": {}}
+	hop := map[string]struct{}{
+		"Connection":          {},
+		"Proxy-Authorization": {},
+		"Proxy-Authenticate":  {},
+		"Keep-Alive":          {},
+		"Te":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+	}
 	for _, v := range h.Values("Connection") {
 		for _, part := range strings.Split(v, ",") {
 			if name := strings.TrimSpace(part); name != "" {
@@ -877,6 +1848,19 @@ func stripHopByHopHeaders(h http.Header) {
 	}
 }
 
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil && n > 0 {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
 func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
 	stripHopByHopHeaders(resp.Header)
@@ -886,7 +1870,11 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	var writer io.Writer = w
+	if f, ok := w.(http.Flusher); ok {
+		writer = flushWriter{w: w, f: f}
+	}
+	_, _ = io.Copy(writer, resp.Body)
 }
 
 func isQuota429(resp *http.Response) bool {
@@ -928,13 +1916,26 @@ func writeAPIError(w http.ResponseWriter, style APIStyle, status int, code, mess
 func writeOpenAIError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": message, "type": "invalid_request_error", "param": nil, "code": code}})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    code,
+		},
+	})
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]any{"type": anthropicErrorType(status, code), "message": message}})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    anthropicErrorType(status, code),
+			"message": message,
+		},
+	})
 }
 
 func anthropicErrorType(status int, code string) string {
@@ -974,7 +1975,6 @@ func (n *SMTPNotifier) send(subject, body string) {
 	}
 }
 
-// tiny indirection to keep stdlib-only and testable.
 var sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -1038,16 +2038,26 @@ func main() {
 		log.Fatal(err)
 	}
 	a := newApp(cfg)
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: a, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 65 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	a.startUsagePoller(ctx)
+
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           a,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       65 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		shut, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shut)
 	}()
-	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
+	log.Printf("startup %s", safeConfigSummary(cfg))
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
