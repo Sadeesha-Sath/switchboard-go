@@ -1160,3 +1160,97 @@ func TestSSEFlushing(t *testing.T) {
 		t.Fatalf("expected chunks in response, got %s", rec.Body.String())
 	}
 }
+
+func TestKeyPriorityTierFallback(t *testing.T) {
+	configs := []UpstreamKeyConfig{
+		{Key: "primary-1", Priority: 1, Weight: 1},
+		{Key: "primary-2", Priority: 1, Weight: 1},
+		{Key: "backup-1", Priority: 2, Weight: 1},
+	}
+	km := NewKeyManagerWithKeyConfigs(configs, 5*time.Minute, "session_sticky", 2*time.Hour, 1*time.Hour, 95.0)
+
+	// Set usage: primary-1 has 30% weekly, primary-2 has 40% weekly, backup-1 has 5% weekly
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 30}, Rolling: UsageWindow{Percent: 10}}, "")
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 40}, Rolling: UsageWindow{Percent: 10}}, "")
+	km.UpdateUsage(2, &KeyUsage{Weekly: UsageWindow{Percent: 5}, Rolling: UsageWindow{Percent: 10}}, "")
+
+	// Even though backup-1 has lower weekly usage (5%), primary tier (priority 1) MUST be preferred
+	idx, key, ok := km.KeyForRequest("session-1")
+	if !ok || idx != 0 || key != "primary-1" {
+		t.Fatalf("expected primary-1 to be selected from priority 1 tier, got %d %s", idx, key)
+	}
+
+	// Saturated primary-1 (>= 95% rolling) -> falls back to primary-2 (still priority 1)
+	km.UpdateUsage(0, &KeyUsage{Weekly: UsageWindow{Percent: 30}, Rolling: UsageWindow{Percent: 96}}, "")
+	idx, key, ok = km.KeyForRequest("session-2")
+	if !ok || idx != 1 || key != "primary-2" {
+		t.Fatalf("expected primary-2 from priority 1 tier, got %d %s", idx, key)
+	}
+
+	// Saturated primary-2 as well -> now all priority 1 keys are saturated, so fallback to backup-1 (priority 2)
+	km.UpdateUsage(1, &KeyUsage{Weekly: UsageWindow{Percent: 40}, Rolling: UsageWindow{Percent: 96}}, "")
+	idx, key, ok = km.KeyForRequest("session-3")
+	if !ok || idx != 2 || key != "backup-1" {
+		t.Fatalf("expected fallback to backup-1 (priority 2 tier), got %d %s", idx, key)
+	}
+}
+
+func TestWeightedTrafficDistribution(t *testing.T) {
+	configs := []UpstreamKeyConfig{
+		{Key: "key-w3", Priority: 1, Weight: 3},
+		{Key: "key-w1", Priority: 1, Weight: 1},
+	}
+	km := NewKeyManagerWithKeyConfigs(configs, 5*time.Minute, "round_robin", 2*time.Hour, 1*time.Hour, 95.0)
+
+	counts := make(map[int]int)
+	// Make 4 requests
+	for i := 0; i < 4; i++ {
+		idx, _, ok := km.KeyForRequest("")
+		if !ok {
+			t.Fatalf("expected request %d to succeed", i)
+		}
+		counts[idx]++
+	}
+
+	if counts[0] != 3 || counts[1] != 1 {
+		t.Fatalf("expected 3 requests for key-w3 and 1 for key-w1, got %+v", counts)
+	}
+}
+
+func TestLoadConfigWithKeyConfigsYAML(t *testing.T) {
+	yamlContent := `
+server:
+  listen_addr: "127.0.0.1:9090"
+  proxy_api_key: "test-proxy-key"
+
+upstream:
+  base_url: "https://opencode.ai/zen/go/v1"
+  api_keys:
+    - key: "sk-pri"
+      priority: 1
+      weight: 3
+    - key: "sk-sec"
+      priority: 2
+      weight: 1
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("failed to write tmp config: %v", err)
+	}
+
+	t.Setenv("SWITCHBOARD_GO_CONFIG", tmpFile)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	if len(cfg.UpstreamKeyConfigs) != 2 {
+		t.Fatalf("expected 2 key configs, got %d", len(cfg.UpstreamKeyConfigs))
+	}
+	if cfg.UpstreamKeyConfigs[0].Key != "sk-pri" || cfg.UpstreamKeyConfigs[0].Priority != 1 || cfg.UpstreamKeyConfigs[0].Weight != 3 {
+		t.Fatalf("unexpected key config 0: %+v", cfg.UpstreamKeyConfigs[0])
+	}
+	if cfg.UpstreamKeyConfigs[1].Key != "sk-sec" || cfg.UpstreamKeyConfigs[1].Priority != 2 || cfg.UpstreamKeyConfigs[1].Weight != 1 {
+		t.Fatalf("unexpected key config 1: %+v", cfg.UpstreamKeyConfigs[1])
+	}
+}

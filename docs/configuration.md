@@ -49,9 +49,15 @@ server:
 upstream:
   base_url: "https://opencode.ai/zen/go/v1"
   api_keys:
+    # Plain key strings (defaults to priority: 1, weight: 1):
     - "sk-first"
-    - "sk-second"
-    - "sk-third"
+    # Or structured key entries with priority tiers (1 = primary, 2+ = backup) and traffic weights:
+    - key: "sk-primary-heavy"
+      priority: 1
+      weight: 3
+    - key: "sk-backup"
+      priority: 2
+      weight: 1
   # Routing strategy: "session_sticky" (default), "balanced", "round_robin", "fill_first"
   routing_strategy: "session_sticky"
   # How long an idle session retains its assigned key before re-evaluating (default: 2h)
@@ -81,6 +87,11 @@ limits:
   max_request_body_bytes: 20971520
 ```
 
+## Key Priority & Weighting
+
+- **Priority Tiers (`priority`)**: `1` (primary, default), `2` (backup), etc. Keys in higher priority tiers are exhausted or saturated before traffic falls back to lower priority backup tiers.
+- **Traffic Weighting (`weight`)**: Relative weight for traffic distribution (default: `1`). Under `round_robin`, traffic is smoothly interleaved according to relative weights (e.g. `3:1` sends 75% of requests to weight-3 keys). Under `session_sticky`, higher weighted keys receive proportional preference when new sessions are assigned.
+
 ## Routing Strategies
 
 - **`session_sticky`** (default): Routes all requests for a session/conversation to the same upstream key as long as it has capacity (< 95% rolling usage). New sessions are assigned to the subscription key with the lowest weekly/monthly usage. Retains KV prompt caches across back-and-forth chat turns. Sessions expire after 2 hours of inactivity (`session_ttl`).
@@ -95,6 +106,8 @@ limits:
 | `SWITCHBOARD_GO_CONFIG` | No | | Explicit YAML config path. |
 | `PROXY_API_KEY` | Yes\* | | API key clients must use to access this proxy. |
 | `OPENCODE_GO_API_KEYS` | Yes\* | | Comma-separated OpenCode Go API keys. |
+| `OPENCODE_GO_API_KEY_PRIORITIES` | No | `1` | Comma-separated priority tiers for each key (e.g. `1,1,2`). |
+| `OPENCODE_GO_API_KEY_WEIGHTS` | No | `1` | Comma-separated weights for each key (e.g. `3,1,1`). |
 | `LISTEN_ADDR` | No | `:8080` | HTTP listen address. Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL. |
 | `ROUTING_STRATEGY` | No | `session_sticky` | Key selection strategy (`session_sticky`, `balanced`, `round_robin`, `fill_first`). |

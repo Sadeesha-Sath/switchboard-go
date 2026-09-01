@@ -28,11 +28,46 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
+type UpstreamKeyConfig struct {
+	Key      string `yaml:"key"`
+	Priority int    `yaml:"priority"` // 1 = primary (default), 2+ = backup tiers
+	Weight   int    `yaml:"weight"`   // >= 1 (default: 1)
+}
+
+type rawKeyEntry struct {
+	Key      string `yaml:"key"`
+	Priority int    `yaml:"priority"`
+	Weight   int    `yaml:"weight"`
+}
+
+func (r *rawKeyEntry) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		r.Key = strings.TrimSpace(value.Value)
+		r.Priority = 1
+		r.Weight = 1
+		return nil
+	}
+	type plain rawKeyEntry
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*r = rawKeyEntry(p)
+	if r.Priority <= 0 {
+		r.Priority = 1
+	}
+	if r.Weight <= 0 {
+		r.Weight = 1
+	}
+	return nil
+}
+
 type Config struct {
 	ListenAddr          string
 	UpstreamBaseURL     string
 	ProxyAPIKey         string
 	UpstreamAPIKeys     []string
+	UpstreamKeyConfigs  []UpstreamKeyConfig
 	MaxRequestBodyBytes int64
 	// RetryExhaustedAfter is how long a key stays exhausted before it becomes
 	// eligible for an automatic retry probe if upstream reset time is unknown.
@@ -125,15 +160,15 @@ type yamlConfig struct {
 		ProxyAPIKey string `yaml:"proxy_api_key"`
 	} `yaml:"server"`
 	Upstream struct {
-		BaseURL                  string   `yaml:"base_url"`
-		APIKeys                  []string `yaml:"api_keys"`
-		RetryExhaustedAfter      string   `yaml:"retry_exhausted_after"`
-		RoutingStrategy          string   `yaml:"routing_strategy"`
-		SessionTTL               string   `yaml:"session_ttl"`
-		BalancedIdleTimeout      string   `yaml:"balanced_idle_timeout"`
-		UsageCheckInterval       string   `yaml:"usage_check_interval"`
-		ProactiveSwitchThreshold *float64 `yaml:"proactive_switch_threshold"`
-		DisableUsagePolling      *bool    `yaml:"disable_usage_polling"`
+		BaseURL                  string        `yaml:"base_url"`
+		APIKeys                  []rawKeyEntry `yaml:"api_keys"`
+		RetryExhaustedAfter      string        `yaml:"retry_exhausted_after"`
+		RoutingStrategy          string        `yaml:"routing_strategy"`
+		SessionTTL               string        `yaml:"session_ttl"`
+		BalancedIdleTimeout      string        `yaml:"balanced_idle_timeout"`
+		UsageCheckInterval       string        `yaml:"usage_check_interval"`
+		ProactiveSwitchThreshold *float64      `yaml:"proactive_switch_threshold"`
+		DisableUsagePolling      *bool         `yaml:"disable_usage_polling"`
 	} `yaml:"upstream"`
 	SMTP struct {
 		Host     string `yaml:"host"`
@@ -218,11 +253,29 @@ func loadYAMLConfig(path string) (Config, error) {
 		disablePolling = *yc.Upstream.DisableUsagePolling
 	}
 
+	keyConfigs := make([]UpstreamKeyConfig, 0, len(yc.Upstream.APIKeys))
+	keys := make([]string, 0, len(yc.Upstream.APIKeys))
+	for _, entry := range yc.Upstream.APIKeys {
+		if k := strings.TrimSpace(entry.Key); k != "" {
+			p := entry.Priority
+			if p <= 0 {
+				p = 1
+			}
+			w := entry.Weight
+			if w <= 0 {
+				w = 1
+			}
+			keyConfigs = append(keyConfigs, UpstreamKeyConfig{Key: k, Priority: p, Weight: w})
+			keys = append(keys, k)
+		}
+	}
+
 	return Config{
 		ListenAddr:               yc.Server.ListenAddr,
 		UpstreamBaseURL:          yc.Upstream.BaseURL,
 		ProxyAPIKey:              yc.Server.ProxyAPIKey,
-		UpstreamAPIKeys:          yc.Upstream.APIKeys,
+		UpstreamAPIKeys:          keys,
+		UpstreamKeyConfigs:       keyConfigs,
 		MaxRequestBodyBytes:      yc.Limits.MaxRequestBodyBytes,
 		RetryExhaustedAfter:      retry,
 		RoutingStrategy:          yc.Upstream.RoutingStrategy,
@@ -254,8 +307,15 @@ func mergeConfig(dst *Config, src Config) {
 	if src.ProxyAPIKey != "" {
 		dst.ProxyAPIKey = src.ProxyAPIKey
 	}
-	if len(src.UpstreamAPIKeys) > 0 {
+	if len(src.UpstreamKeyConfigs) > 0 {
+		dst.UpstreamKeyConfigs = append([]UpstreamKeyConfig(nil), src.UpstreamKeyConfigs...)
 		dst.UpstreamAPIKeys = append([]string(nil), src.UpstreamAPIKeys...)
+	} else if len(src.UpstreamAPIKeys) > 0 {
+		dst.UpstreamAPIKeys = append([]string(nil), src.UpstreamAPIKeys...)
+		dst.UpstreamKeyConfigs = make([]UpstreamKeyConfig, len(src.UpstreamAPIKeys))
+		for i, k := range src.UpstreamAPIKeys {
+			dst.UpstreamKeyConfigs[i] = UpstreamKeyConfig{Key: k, Priority: 1, Weight: 1}
+		}
 	}
 	if src.MaxRequestBodyBytes > 0 {
 		dst.MaxRequestBodyBytes = src.MaxRequestBodyBytes
@@ -301,6 +361,18 @@ func mergeConfig(dst *Config, src Config) {
 	dst.SMTP.StartTLS = src.SMTP.StartTLS || dst.SMTP.StartTLS
 }
 
+func parseCommaInts(s string) []int {
+	var res []int
+	for _, part := range strings.Split(s, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				res = append(res, n)
+			}
+		}
+	}
+	return res
+}
+
 func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("LISTEN_ADDR")); v != "" {
 		cfg.ListenAddr = v
@@ -320,6 +392,26 @@ func applyEnvOverrides(cfg *Config) {
 		}
 		if len(keys) > 0 {
 			cfg.UpstreamAPIKeys = keys
+			priorities := parseCommaInts(os.Getenv("OPENCODE_GO_API_KEY_PRIORITIES"))
+			weights := parseCommaInts(os.Getenv("OPENCODE_GO_API_KEY_WEIGHTS"))
+			cfg.UpstreamKeyConfigs = make([]UpstreamKeyConfig, len(keys))
+			for i, k := range keys {
+				p := 1
+				if i < len(priorities) && priorities[i] > 0 {
+					p = priorities[i]
+				}
+				w := 1
+				if i < len(weights) && weights[i] > 0 {
+					w = weights[i]
+				}
+				cfg.UpstreamKeyConfigs[i] = UpstreamKeyConfig{Key: k, Priority: p, Weight: w}
+			}
+		}
+	}
+	if len(cfg.UpstreamKeyConfigs) == 0 && len(cfg.UpstreamAPIKeys) > 0 {
+		cfg.UpstreamKeyConfigs = make([]UpstreamKeyConfig, len(cfg.UpstreamAPIKeys))
+		for i, k := range cfg.UpstreamAPIKeys {
+			cfg.UpstreamKeyConfigs[i] = UpstreamKeyConfig{Key: k, Priority: 1, Weight: 1}
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("MAX_REQUEST_BODY_BYTES")); v != "" {
@@ -710,6 +802,9 @@ func extractSessionID(r *http.Request, body []byte) string {
 type KeyManager struct {
 	mu                  sync.Mutex
 	keys                []string
+	priorities          []int
+	weights             []int
+	currentWeights      []int
 	states              []KeyState
 	last429             map[int]time.Time
 	resetTimes          map[int]time.Time
@@ -730,14 +825,44 @@ type KeyManager struct {
 }
 
 func NewKeyManager(keys []string, cooldown time.Duration) *KeyManager {
-	return NewKeyManagerWithConfig(keys, cooldown, "session_sticky", 2*time.Hour, 1*time.Hour, 95.0)
+	configs := make([]UpstreamKeyConfig, len(keys))
+	for i, k := range keys {
+		configs[i] = UpstreamKeyConfig{Key: k, Priority: 1, Weight: 1}
+	}
+	return NewKeyManagerWithKeyConfigs(configs, cooldown, "session_sticky", 2*time.Hour, 1*time.Hour, 95.0)
 }
 
 func NewKeyManagerWithConfig(keys []string, cooldown time.Duration, strategy string, sessionTTL, balancedIdle time.Duration, proactiveThreshold float64) *KeyManager {
-	states := make([]KeyState, len(keys))
-	for i := range states {
+	configs := make([]UpstreamKeyConfig, len(keys))
+	for i, k := range keys {
+		configs[i] = UpstreamKeyConfig{Key: k, Priority: 1, Weight: 1}
+	}
+	return NewKeyManagerWithKeyConfigs(configs, cooldown, strategy, sessionTTL, balancedIdle, proactiveThreshold)
+}
+
+func NewKeyManagerWithKeyConfigs(configs []UpstreamKeyConfig, cooldown time.Duration, strategy string, sessionTTL, balancedIdle time.Duration, proactiveThreshold float64) *KeyManager {
+	n := len(configs)
+	keys := make([]string, n)
+	priorities := make([]int, n)
+	weights := make([]int, n)
+	currentWeights := make([]int, n)
+	states := make([]KeyState, n)
+
+	for i, c := range configs {
+		keys[i] = c.Key
+		p := c.Priority
+		if p <= 0 {
+			p = 1
+		}
+		priorities[i] = p
+		w := c.Weight
+		if w <= 0 {
+			w = 1
+		}
+		weights[i] = w
 		states[i] = KeyUnknown
 	}
+
 	if strategy == "" {
 		strategy = "session_sticky"
 	}
@@ -751,7 +876,10 @@ func NewKeyManagerWithConfig(keys []string, cooldown time.Duration, strategy str
 		sessionTTL = 2 * time.Hour
 	}
 	return &KeyManager{
-		keys:                append([]string(nil), keys...),
+		keys:                keys,
+		priorities:          priorities,
+		weights:             weights,
+		currentWeights:      currentWeights,
 		states:              states,
 		last429:             map[int]time.Time{},
 		resetTimes:          map[int]time.Time{},
@@ -797,10 +925,12 @@ func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
 	}
 
 	type candidate struct {
-		index   int
-		weekly  float64
-		monthly float64
-		rolling float64
+		index    int
+		priority int
+		weight   int
+		weekly   float64
+		monthly  float64
+		rolling  float64
 	}
 
 	var healthy []candidate
@@ -814,7 +944,11 @@ func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
 		if !m.eligibleLocked(i) {
 			continue
 		}
-		c := candidate{index: i}
+		c := candidate{
+			index:    i,
+			priority: m.priorities[i],
+			weight:   m.weights[i],
+		}
 		if u, ok := m.usageData[i]; ok && u != nil {
 			c.weekly = u.Weekly.Percent
 			c.monthly = u.Monthly.Percent
@@ -829,12 +963,31 @@ func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
 		}
 	}
 
-	pool := healthy
+	filterBestTier := func(pool []candidate) []candidate {
+		if len(pool) == 0 {
+			return nil
+		}
+		minPriority := pool[0].priority
+		for _, c := range pool[1:] {
+			if c.priority < minPriority {
+				minPriority = c.priority
+			}
+		}
+		var tier []candidate
+		for _, c := range pool {
+			if c.priority == minPriority {
+				tier = append(tier, c)
+			}
+		}
+		return tier
+	}
+
+	pool := filterBestTier(healthy)
 	if len(pool) == 0 {
-		pool = saturated
+		pool = filterBestTier(saturated)
 	}
 	if len(pool) == 0 {
-		pool = exhausted
+		pool = filterBestTier(exhausted)
 	}
 	if len(pool) == 0 {
 		return 0, false
@@ -850,6 +1003,10 @@ func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
 			} else if c.monthly == best.monthly {
 				if c.rolling < best.rolling {
 					best = c
+				} else if c.rolling == best.rolling {
+					if c.weight > best.weight {
+						best = c
+					}
 				}
 			}
 		}
@@ -909,34 +1066,98 @@ func (m *KeyManager) KeyForRequest(sessionID string, exclude ...map[int]bool) (i
 		return 0, "", false
 
 	case "round_robin":
-		for step := 0; step < len(m.keys); step++ {
-			next := (m.roundRobinIndex + step) % len(m.keys)
-			if (tried == nil || !tried[next]) && m.eligibleLocked(next) && !m.isProactivelySaturatedLocked(next) && m.states[next] != KeyExhausted {
-				m.roundRobinIndex = (next + 1) % len(m.keys)
-				m.current = next
-				return next, m.keys[next], true
+		var eligibleHealthy []int
+		for i := range m.keys {
+			if (tried == nil || !tried[i]) && m.eligibleLocked(i) && !m.isProactivelySaturatedLocked(i) && m.states[i] != KeyExhausted {
+				eligibleHealthy = append(eligibleHealthy, i)
 			}
 		}
-		for step := 0; step < len(m.keys); step++ {
-			next := (m.roundRobinIndex + step) % len(m.keys)
-			if (tried == nil || !tried[next]) && m.eligibleLocked(next) {
-				m.roundRobinIndex = (next + 1) % len(m.keys)
-				m.current = next
-				return next, m.keys[next], true
+		var pool []int
+		if len(eligibleHealthy) > 0 {
+			minP := m.priorities[eligibleHealthy[0]]
+			for _, idx := range eligibleHealthy[1:] {
+				if m.priorities[idx] < minP {
+					minP = m.priorities[idx]
+				}
+			}
+			for _, idx := range eligibleHealthy {
+				if m.priorities[idx] == minP {
+					pool = append(pool, idx)
+				}
+			}
+		} else {
+			var allEligible []int
+			for i := range m.keys {
+				if (tried == nil || !tried[i]) && m.eligibleLocked(i) {
+					allEligible = append(allEligible, i)
+				}
+			}
+			if len(allEligible) > 0 {
+				minP := m.priorities[allEligible[0]]
+				for _, idx := range allEligible[1:] {
+					if m.priorities[idx] < minP {
+						minP = m.priorities[idx]
+					}
+				}
+				for _, idx := range allEligible {
+					if m.priorities[idx] == minP {
+						pool = append(pool, idx)
+					}
+				}
 			}
 		}
-		return 0, "", false
+		if len(pool) == 0 {
+			return 0, "", false
+		}
+
+		totalWeight := 0
+		bestIdx := pool[0]
+		maxCurrentWeight := math.MinInt32
+
+		for _, idx := range pool {
+			w := m.weights[idx]
+			if w <= 0 {
+				w = 1
+			}
+			m.currentWeights[idx] += w
+			totalWeight += w
+			if m.currentWeights[idx] > maxCurrentWeight {
+				maxCurrentWeight = m.currentWeights[idx]
+				bestIdx = idx
+			}
+		}
+		m.currentWeights[bestIdx] -= totalWeight
+		m.current = bestIdx
+		return bestIdx, m.keys[bestIdx], true
 
 	case "fill_first":
 		fallthrough
 	default:
+		type keyRef struct {
+			idx      int
+			priority int
+		}
+		ordered := make([]keyRef, len(m.keys))
 		for i := range m.keys {
+			ordered[i] = keyRef{idx: i, priority: m.priorities[i]}
+		}
+		for i := 0; i < len(ordered); i++ {
+			for j := i + 1; j < len(ordered); j++ {
+				if ordered[j].priority < ordered[i].priority {
+					ordered[i], ordered[j] = ordered[j], ordered[i]
+				}
+			}
+		}
+
+		for _, ref := range ordered {
+			i := ref.idx
 			if (tried == nil || !tried[i]) && m.eligibleLocked(i) && !m.isProactivelySaturatedLocked(i) && m.states[i] != KeyExhausted {
 				m.current = i
 				return i, m.keys[i], true
 			}
 		}
-		for i := range m.keys {
+		for _, ref := range ordered {
+			i := ref.idx
 			if (tried == nil || !tried[i]) && m.eligibleLocked(i) {
 				m.current = i
 				return i, m.keys[i], true
@@ -1079,7 +1300,15 @@ func (m *KeyManager) Status() StatusResponse {
 			display = KeyAvailable
 		}
 		eligible := m.eligibleLocked(i)
-		ps := PerKeyStatus{Index: i, State: string(display), Last429Time: m.last429String(i), Current: i == m.current, Eligible: eligible}
+		ps := PerKeyStatus{
+			Index:       i,
+			State:       string(display),
+			Priority:    m.priorities[i],
+			Weight:      m.weights[i],
+			Last429Time: m.last429String(i),
+			Current:     i == m.current,
+			Eligible:    eligible,
+		}
 		if state == KeyExhausted && !eligible {
 			var resetAt time.Time
 			if t, ok := m.resetTimes[i]; ok && !t.IsZero() {
@@ -1164,6 +1393,8 @@ func (m *KeyManager) last429String(i int) string {
 type PerKeyStatus struct {
 	Index             int    `json:"index"`
 	State             string `json:"state"`
+	Priority          int    `json:"priority"`
+	Weight            int    `json:"weight"`
 	Last429Time       string `json:"last_429_time,omitempty"`
 	Current           bool   `json:"current"`
 	Eligible          bool   `json:"eligible"`
@@ -1204,6 +1435,8 @@ type UsageSummary struct {
 type PerKeyUsage struct {
 	Index             int         `json:"index"`
 	State             string      `json:"state"`
+	Priority          int         `json:"priority"`
+	Weight            int         `json:"weight"`
 	Current           bool        `json:"current"`
 	Eligible          bool        `json:"eligible"`
 	RetryAfterSeconds int         `json:"retry_after_seconds,omitempty"`
@@ -1255,6 +1488,8 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 		pku := PerKeyUsage{
 			Index:    i,
 			State:    string(display),
+			Priority: m.priorities[i],
+			Weight:   m.weights[i],
 			Current:  i == m.current,
 			Eligible: eligible,
 			Error:    m.usageErrors[i],
@@ -1364,17 +1599,25 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 		},
 	}
 
-	topRolling := UsageWindow{Status: "ok", Percent: avgRolling}
-	if earliestReset != nil {
-		topRolling.ResetsAt = *earliestReset
-	}
-	topWeekly := UsageWindow{Status: "ok", Percent: avgWeekly}
-	topMonthly := UsageWindow{Status: "ok", Percent: avgMonthly}
-
 	return AggregatedUsageResponse{
-		Rolling: topRolling,
-		Weekly:  topWeekly,
-		Monthly: topMonthly,
+		Rolling: UsageWindow{
+			Status:  "ok",
+			Percent: avgRolling,
+			ResetsAt: func() time.Time {
+				if earliestReset != nil {
+					return *earliestReset
+				}
+				return time.Time{}
+			}(),
+		},
+		Weekly: UsageWindow{
+			Status:  "ok",
+			Percent: avgWeekly,
+		},
+		Monthly: UsageWindow{
+			Status:  "ok",
+			Percent: avgMonthly,
+		},
 		Summary: UsageSummary{
 			TotalKeys:                 n,
 			AvailableKeys:             availableCount,
@@ -1407,14 +1650,26 @@ type App struct {
 }
 
 func newApp(cfg Config) *App {
-	km := NewKeyManagerWithConfig(
-		cfg.UpstreamAPIKeys,
-		cfg.RetryExhaustedAfter,
-		cfg.RoutingStrategy,
-		cfg.SessionTTL,
-		cfg.BalancedIdleTimeout,
-		cfg.ProactiveSwitchThreshold,
-	)
+	var km *KeyManager
+	if len(cfg.UpstreamKeyConfigs) > 0 {
+		km = NewKeyManagerWithKeyConfigs(
+			cfg.UpstreamKeyConfigs,
+			cfg.RetryExhaustedAfter,
+			cfg.RoutingStrategy,
+			cfg.SessionTTL,
+			cfg.BalancedIdleTimeout,
+			cfg.ProactiveSwitchThreshold,
+		)
+	} else {
+		km = NewKeyManagerWithConfig(
+			cfg.UpstreamAPIKeys,
+			cfg.RetryExhaustedAfter,
+			cfg.RoutingStrategy,
+			cfg.SessionTTL,
+			cfg.BalancedIdleTimeout,
+			cfg.ProactiveSwitchThreshold,
+		)
+	}
 	return &App{
 		config: cfg,
 		keys:   km,
