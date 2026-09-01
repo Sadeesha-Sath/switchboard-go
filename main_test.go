@@ -1545,3 +1545,100 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		t.Fatalf("expected switchboard_active_sessions in metrics output")
 	}
 }
+
+func TestDynamicConfigReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "switchboard.yaml")
+
+	initialYAML := `
+server:
+  listen_addr: ":8080"
+  proxy_api_key: "proxy-secret"
+upstream:
+  base_url: "https://opencode.ai/zen/go/v1"
+  api_keys:
+    - key: "key-1"
+      priority: 1
+      weight: 2
+    - key: "key-2"
+      priority: 2
+      weight: 1
+  routing_strategy: "session_sticky"
+`
+	if err := os.WriteFile(configPath, []byte(initialYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadYAMLConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConfigSourcePath = configPath
+	cfg.DisableUsagePolling = true
+
+	app := newApp(cfg)
+
+	// In the initial state, we have key-1 and key-2
+	status := app.keys.Status()
+	if len(status.Keys) != 2 {
+		t.Fatalf("expected 2 keys initially, got %d", len(status.Keys))
+	}
+	if app.keys.priorities[0] != 1 || app.keys.weights[0] != 2 {
+		t.Fatalf("unexpected initial priority/weight: priority=%d, weight=%d", app.keys.priorities[0], app.keys.weights[0])
+	}
+
+	// Mark key-1 as exhausted
+	app.keys.MarkExhausted(0)
+
+	// Now rewrite the config file with key-1 (updated weight/priority), removed key-2, and added key-3
+	updatedYAML := `
+server:
+  listen_addr: ":8080"
+  proxy_api_key: "proxy-secret"
+upstream:
+  base_url: "https://opencode.ai/zen/go/v1"
+  api_keys:
+    - key: "key-1"
+      priority: 1
+      weight: 5
+    - key: "key-3"
+      priority: 1
+      weight: 3
+  routing_strategy: "balanced"
+`
+	if err := os.WriteFile(configPath, []byte(updatedYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call POST /admin/reload
+	t.Setenv("SWITCHBOARD_GO_CONFIG", configPath)
+	req := httptest.NewRequest(http.MethodPost, "/admin/reload", nil)
+	req.Header.Set("Authorization", "Bearer proxy-secret")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /admin/reload, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify updated KeyManager state
+	status = app.keys.Status()
+	if len(status.Keys) != 2 {
+		t.Fatalf("expected 2 keys after reload, got %d", len(status.Keys))
+	}
+	if app.keys.keys[0] != "key-1" || app.keys.keys[1] != "key-3" {
+		t.Fatalf("unexpected keys after reload: %+v", app.keys.keys)
+	}
+	// key-1 was retained and should still be exhausted
+	if status.Keys[0].State != "exhausted" {
+		t.Fatalf("expected key-1 to retain exhausted state, got %s", status.Keys[0].State)
+	}
+	// key-1 weight should be 5
+	if app.keys.weights[0] != 5 {
+		t.Fatalf("expected key-1 weight 5, got %d", app.keys.weights[0])
+	}
+	// strategy should be updated to balanced
+	if app.keys.routingStrategy != "balanced" {
+		t.Fatalf("expected strategy balanced, got %s", app.keys.routingStrategy)
+	}
+}

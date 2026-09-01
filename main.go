@@ -1390,6 +1390,112 @@ func (m *KeyManager) allExhaustedLocked() bool {
 	return true
 }
 
+func (m *KeyManager) ReloadKeys(configs []UpstreamKeyConfig, cooldown time.Duration, strategy string, sessionTTL, balancedIdle time.Duration, proactiveThreshold float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	n := len(configs)
+	newKeys := make([]string, n)
+	newPriorities := make([]int, n)
+	newWeights := make([]int, n)
+	newCurrentWeights := make([]int, n)
+	newStates := make([]KeyState, n)
+	newLast429 := make(map[int]time.Time)
+	newResetTimes := make(map[int]time.Time)
+	newUsageData := make(map[int]*KeyUsage)
+	newLastUsageCheck := make(map[int]time.Time)
+	newUsageErrors := make(map[int]string)
+	newNotifiedSwitch := make(map[int]bool)
+
+	oldKeyIndex := make(map[string]int)
+	for idx, k := range m.keys {
+		oldKeyIndex[k] = idx
+	}
+
+	retainedOldIndices := make(map[int]int)
+
+	for newIdx, c := range configs {
+		newKeys[newIdx] = c.Key
+		p := c.Priority
+		if p <= 0 {
+			p = 1
+		}
+		newPriorities[newIdx] = p
+		w := c.Weight
+		if w <= 0 {
+			w = 1
+		}
+		newWeights[newIdx] = w
+
+		if oldIdx, exists := oldKeyIndex[c.Key]; exists {
+			newStates[newIdx] = m.states[oldIdx]
+			if t, ok := m.last429[oldIdx]; ok {
+				newLast429[newIdx] = t
+			}
+			if t, ok := m.resetTimes[oldIdx]; ok {
+				newResetTimes[newIdx] = t
+			}
+			if u, ok := m.usageData[oldIdx]; ok {
+				newUsageData[newIdx] = u
+			}
+			if t, ok := m.lastUsageCheck[oldIdx]; ok {
+				newLastUsageCheck[newIdx] = t
+			}
+			if e, ok := m.usageErrors[oldIdx]; ok {
+				newUsageErrors[newIdx] = e
+			}
+			if b, ok := m.notifiedSwitch[oldIdx]; ok {
+				newNotifiedSwitch[newIdx] = b
+			}
+			retainedOldIndices[oldIdx] = newIdx
+		} else {
+			newStates[newIdx] = KeyUnknown
+		}
+	}
+
+	if m.sessionMgr != nil {
+		for oldIdx := range m.keys {
+			if _, retained := retainedOldIndices[oldIdx]; !retained {
+				m.sessionMgr.InvalidateKey(oldIdx)
+			}
+		}
+		if sessionTTL > 0 {
+			m.sessionMgr.ttl = sessionTTL
+		}
+	}
+
+	m.keys = newKeys
+	m.priorities = newPriorities
+	m.weights = newWeights
+	m.currentWeights = newCurrentWeights
+	m.states = newStates
+	m.last429 = newLast429
+	m.resetTimes = newResetTimes
+	m.usageData = newUsageData
+	m.lastUsageCheck = newLastUsageCheck
+	m.usageErrors = newUsageErrors
+	m.notifiedSwitch = newNotifiedSwitch
+
+	if m.current >= n {
+		m.current = 0
+	}
+	if m.roundRobinIndex >= n {
+		m.roundRobinIndex = 0
+	}
+	if cooldown >= 0 {
+		m.cooldown = cooldown
+	}
+	if strategy != "" {
+		m.routingStrategy = strategy
+	}
+	if proactiveThreshold > 0 {
+		m.proactiveThreshold = proactiveThreshold
+	}
+	if balancedIdle > 0 {
+		m.balancedIdleTimeout = balancedIdle
+	}
+}
+
 func (m *KeyManager) Status() StatusResponse {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2054,6 +2160,8 @@ func isProxyPath(path string) bool {
 
 func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case (r.URL.Path == "/admin/reload" || r.URL.Path == "/v1/admin/reload") && r.Method == http.MethodPost:
+		a.handleReload(w, r)
 	case r.URL.Path == "/admin/validate-keys" && r.Method == http.MethodPost:
 		a.handleValidateKeys(w, r)
 	case r.URL.Path == "/admin/reset-key" && r.Method == http.MethodPost:
@@ -2066,6 +2174,40 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a *App) ReloadConfig() error {
+	newCfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("reload config failed: %w", err)
+	}
+
+	a.config = newCfg
+	a.keys.ReloadKeys(
+		newCfg.UpstreamKeyConfigs,
+		newCfg.RetryExhaustedAfter,
+		newCfg.RoutingStrategy,
+		newCfg.SessionTTL,
+		newCfg.BalancedIdleTimeout,
+		newCfg.ProactiveSwitchThreshold,
+	)
+	a.sender = NewAlertNotifier(newCfg.SMTP, newCfg.Alerts)
+	log.Printf("config reloaded: %s", safeConfigSummary(newCfg))
+	return nil
+}
+
+func (a *App) handleReload(w http.ResponseWriter, r *http.Request) {
+	if err := a.ReloadConfig(); err != nil {
+		writeAPIError(w, apiStyleForRequest(r), http.StatusInternalServerError, "config_reload_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":        "ok",
+		"message":       "configuration reloaded successfully",
+		"total_keys":    len(a.config.UpstreamAPIKeys),
+		"strategy":      a.config.RoutingStrategy,
+		"config_source": defaultString(a.config.ConfigSourcePath, "none"),
+	})
 }
 
 func (a *App) handleUsage(w http.ResponseWriter, r *http.Request) {
@@ -2837,6 +2979,22 @@ func main() {
 	defer stop()
 
 	a.startUsagePoller(ctx)
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				log.Println("received SIGHUP, reloading configuration...")
+				if err := a.ReloadConfig(); err != nil {
+					log.Printf("SIGHUP reload error: %v", err)
+				}
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,

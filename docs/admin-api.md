@@ -234,6 +234,34 @@ curl -X POST http://127.0.0.1:8080/admin/validate-keys \
   -H "Authorization: Bearer $PROXY_API_KEY"
 ```
 
+## Reload configuration & keys
+
+`POST /admin/reload` or sending a `SIGHUP` signal to the process dynamically reloads the configuration file, updating the active key pool, priorities, traffic weights, routing strategy, model aliases, and alert webhooks in-memory without downtime or dropping active sessions.
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/reload \
+  -H "Authorization: Bearer $PROXY_API_KEY"
+```
+
+Or via POSIX signal:
+
+```bash
+kill -HUP $(pgrep switchboard-go)
+```
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "message": "configuration reloaded successfully",
+  "total_keys": 3,
+  "strategy": "session_sticky",
+  "config_source": "/etc/switchboard-go/config.yaml"
+}
+```
+
+
 
 ## Health and readiness
 
