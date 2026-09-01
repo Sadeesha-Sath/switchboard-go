@@ -62,6 +62,21 @@ func (r *rawKeyEntry) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+type WebhookConfig struct {
+	URL  string `yaml:"url"`
+	Type string `yaml:"type"` // "generic", "discord", "slack"
+}
+
+type TelegramConfig struct {
+	BotToken string `yaml:"bot_token"`
+	ChatID   string `yaml:"chat_id"`
+}
+
+type AlertConfig struct {
+	Webhooks []WebhookConfig `yaml:"webhooks"`
+	Telegram TelegramConfig  `yaml:"telegram"`
+}
+
 type Config struct {
 	ListenAddr          string
 	UpstreamBaseURL     string
@@ -83,7 +98,8 @@ type Config struct {
 	ModelAliases          map[string]string
 	SanitizeDeveloperRole bool
 
-	SMTP SMTPConfig
+	Alerts AlertConfig
+	SMTP   SMTPConfig
 }
 
 type SMTPConfig struct {
@@ -181,6 +197,10 @@ type yamlConfig struct {
 	Transformations struct {
 		SanitizeDeveloperRole *bool `yaml:"sanitize_developer_role"`
 	} `yaml:"transformations"`
+	Alerts struct {
+		Webhooks []WebhookConfig `yaml:"webhooks"`
+		Telegram TelegramConfig  `yaml:"telegram"`
+	} `yaml:"alerts"`
 	SMTP struct {
 		Host     string `yaml:"host"`
 		Username string `yaml:"username"`
@@ -292,6 +312,11 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 	}
 
+	alerts := AlertConfig{
+		Webhooks: append([]WebhookConfig(nil), yc.Alerts.Webhooks...),
+		Telegram: yc.Alerts.Telegram,
+	}
+
 	return Config{
 		ListenAddr:               yc.Server.ListenAddr,
 		UpstreamBaseURL:          yc.Upstream.BaseURL,
@@ -308,6 +333,7 @@ func loadYAMLConfig(path string) (Config, error) {
 		DisableUsagePolling:      disablePolling,
 		ModelAliases:             modelAliases,
 		SanitizeDeveloperRole:    sanitizeRole,
+		Alerts:                   alerts,
 		SMTP: SMTPConfig{
 			Host:     yc.SMTP.Host,
 			Port:     yc.SMTP.Port,
@@ -372,6 +398,12 @@ func mergeConfig(dst *Config, src Config) {
 		}
 	}
 	dst.SanitizeDeveloperRole = src.SanitizeDeveloperRole
+	if len(src.Alerts.Webhooks) > 0 {
+		dst.Alerts.Webhooks = append([]WebhookConfig(nil), src.Alerts.Webhooks...)
+	}
+	if src.Alerts.Telegram.BotToken != "" {
+		dst.Alerts.Telegram = src.Alerts.Telegram
+	}
 	if src.SMTP.Host != "" {
 		dst.SMTP.Host = src.SMTP.Host
 	}
@@ -510,6 +542,24 @@ func applyEnvOverrides(cfg *Config) {
 				}
 			}
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("GENERIC_WEBHOOK_URL")); v != "" {
+		cfg.Alerts.Webhooks = append(cfg.Alerts.Webhooks, WebhookConfig{URL: v, Type: "generic"})
+	}
+	if v := strings.TrimSpace(os.Getenv("WEBHOOK_URL")); v != "" {
+		cfg.Alerts.Webhooks = append(cfg.Alerts.Webhooks, WebhookConfig{URL: v, Type: "generic"})
+	}
+	if v := strings.TrimSpace(os.Getenv("DISCORD_WEBHOOK_URL")); v != "" {
+		cfg.Alerts.Webhooks = append(cfg.Alerts.Webhooks, WebhookConfig{URL: v, Type: "discord"})
+	}
+	if v := strings.TrimSpace(os.Getenv("SLACK_WEBHOOK_URL")); v != "" {
+		cfg.Alerts.Webhooks = append(cfg.Alerts.Webhooks, WebhookConfig{URL: v, Type: "slack"})
+	}
+	if v := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")); v != "" {
+		cfg.Alerts.Telegram.BotToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")); v != "" {
+		cfg.Alerts.Telegram.ChatID = v
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {
 		cfg.SMTP.Host = v
@@ -1697,7 +1747,7 @@ type App struct {
 	config Config
 	keys   *KeyManager
 	client *http.Client
-	sender *SMTPNotifier
+	sender *AlertNotifier
 }
 
 func newApp(cfg Config) *App {
@@ -1736,7 +1786,7 @@ func newApp(cfg Config) *App {
 				ExpectContinueTimeout: 2 * time.Second,
 			},
 		},
-		sender: NewSMTPNotifier(cfg.SMTP),
+		sender: NewAlertNotifier(cfg.SMTP, cfg.Alerts),
 	}
 }
 
@@ -2358,27 +2408,143 @@ func anthropicErrorType(status int, code string) string {
 	}
 }
 
-type SMTPNotifier struct{ cfg SMTPConfig }
+type AlertNotifier struct {
+	smtp   SMTPConfig
+	alerts AlertConfig
+	client *http.Client
+}
 
-func NewSMTPNotifier(cfg SMTPConfig) *SMTPNotifier { return &SMTPNotifier{cfg: cfg} }
-func (n *SMTPNotifier) NotifySwitch(idx int, st StatusResponse) {
-	go n.send("Switchboard Go switched upstream key", fmt.Sprintf("Switched away from key %d\n\n%+v", idx, st))
+type SMTPNotifier = AlertNotifier
+
+func NewAlertNotifier(smtpCfg SMTPConfig, alerts AlertConfig) *AlertNotifier {
+	return &AlertNotifier{
+		smtp:   smtpCfg,
+		alerts: alerts,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+	}
 }
-func (n *SMTPNotifier) NotifyAllExhausted(st StatusResponse) {
-	go n.send("Switchboard Go exhausted all upstream keys", fmt.Sprintf("All keys exhausted\n\n%+v", st))
+
+func NewSMTPNotifier(cfg SMTPConfig) *AlertNotifier {
+	return NewAlertNotifier(cfg, AlertConfig{})
 }
-func (n *SMTPNotifier) send(subject, body string) {
-	if n.cfg.Host == "" || n.cfg.To == "" || n.cfg.From == "" {
+
+func (n *AlertNotifier) NotifySwitch(idx int, st StatusResponse) {
+	msg := fmt.Sprintf("Switchboard Go switched away from exhausted key #%d", idx)
+	details := fmt.Sprintf("Switched away from key %d\n\n%+v", idx, st)
+	n.dispatch("key_switch", msg, details, idx, st)
+}
+
+func (n *AlertNotifier) NotifyAllExhausted(st StatusResponse) {
+	msg := "Switchboard Go exhausted all upstream keys"
+	details := fmt.Sprintf("All upstream keys are exhausted\n\n%+v", st)
+	n.dispatch("all_exhausted", msg, details, -1, st)
+}
+
+func (n *AlertNotifier) dispatch(eventType, subject, details string, keyIndex int, st StatusResponse) {
+	go n.sendSMTP(subject, details)
+	for _, wh := range n.alerts.Webhooks {
+		whCopy := wh
+		go n.sendWebhook(whCopy, eventType, subject, details, keyIndex, st)
+	}
+	if n.alerts.Telegram.BotToken != "" && n.alerts.Telegram.ChatID != "" {
+		go n.sendTelegram(n.alerts.Telegram, subject, details)
+	}
+}
+
+func (n *AlertNotifier) sendSMTP(subject, body string) {
+	if n.smtp.Host == "" || n.smtp.To == "" || n.smtp.From == "" {
 		return
 	}
-	addr := net.JoinHostPort(n.cfg.Host, strconv.Itoa(n.cfg.Port))
+	addr := net.JoinHostPort(n.smtp.Host, strconv.Itoa(n.smtp.Port))
 	auth := smtp.Auth(nil)
-	if strings.TrimSpace(n.cfg.Username) != "" {
-		auth = smtp.PlainAuth("", n.cfg.Username, n.cfg.Password, n.cfg.Host)
+	if strings.TrimSpace(n.smtp.Username) != "" {
+		auth = smtp.PlainAuth("", n.smtp.Username, n.smtp.Password, n.smtp.Host)
 	}
-	msg := []byte("To: " + n.cfg.To + "\r\nSubject: " + subject + "\r\n\r\n" + body + "\r\n")
-	if err := sendMail(addr, auth, n.cfg.From, []string{n.cfg.To}, msg, n.cfg.TLS, n.cfg.StartTLS); err != nil {
+	msg := []byte("To: " + n.smtp.To + "\r\nSubject: " + subject + "\r\n\r\n" + body + "\r\n")
+	if err := sendMail(addr, auth, n.smtp.From, []string{n.smtp.To}, msg, n.smtp.TLS, n.smtp.StartTLS); err != nil {
 		log.Printf("smtp notification failed: %v", err)
+	}
+}
+
+func (n *AlertNotifier) sendWebhook(wh WebhookConfig, eventType, subject, details string, keyIndex int, st StatusResponse) {
+	if strings.TrimSpace(wh.URL) == "" {
+		return
+	}
+	var payload []byte
+	var err error
+
+	whType := strings.ToLower(strings.TrimSpace(wh.Type))
+	switch whType {
+	case "discord":
+		body := map[string]any{
+			"content": fmt.Sprintf("⚠️ **Switchboard Alert**: %s\n```\n%s\n```", subject, details),
+		}
+		payload, err = json.Marshal(body)
+	case "slack":
+		body := map[string]any{
+			"text": fmt.Sprintf("⚠️ *Switchboard Alert*: %s\n```%s```", subject, details),
+		}
+		payload, err = json.Marshal(body)
+	default:
+		body := map[string]any{
+			"event":     eventType,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"message":   subject,
+			"key_index": keyIndex,
+			"status":    st,
+		}
+		payload, err = json.Marshal(body)
+	}
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, wh.URL, bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("webhook request create failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Switchboard-Go-Notifier/1.0")
+
+	resp, err := n.client.Do(req)
+	if err != nil {
+		log.Printf("webhook notification to %s failed: %v", wh.URL, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("webhook %s returned non-2xx status: %d", wh.URL, resp.StatusCode)
+	}
+}
+
+func (n *AlertNotifier) sendTelegram(tg TelegramConfig, subject, details string) {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", tg.BotToken)
+	body := map[string]any{
+		"chat_id": tg.ChatID,
+		"text":    fmt.Sprintf("⚠️ Switchboard Alert: %s\n\n%s", subject, details),
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("telegram request create failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := n.client.Do(req)
+	if err != nil {
+		log.Printf("telegram notification failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("telegram returned non-2xx status: %d", resp.StatusCode)
 	}
 }
 

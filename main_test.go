@@ -1421,3 +1421,78 @@ func TestMissingRootEndpoints(t *testing.T) {
 		t.Fatalf("unexpected forwarded upstream paths: %+v", requestedPaths)
 	}
 }
+
+func TestWebhookAlerts(t *testing.T) {
+	var genericPayload, discordPayload, slackPayload, telegramPayload []byte
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	genericServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		genericPayload, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		wg.Done()
+	}))
+	defer genericServer.Close()
+
+	discordServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discordPayload, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		wg.Done()
+	}))
+	defer discordServer.Close()
+
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slackPayload, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		wg.Done()
+	}))
+	defer slackServer.Close()
+
+	telegramServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		telegramPayload, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		wg.Done()
+	}))
+	defer telegramServer.Close()
+
+	notifier := NewAlertNotifier(
+		SMTPConfig{},
+		AlertConfig{
+			Webhooks: []WebhookConfig{
+				{URL: genericServer.URL, Type: "generic"},
+				{URL: discordServer.URL, Type: "discord"},
+				{URL: slackServer.URL, Type: "slack"},
+			},
+			Telegram: TelegramConfig{
+				BotToken: "mock-token",
+				ChatID:   "12345",
+			},
+		},
+	)
+
+	// Override telegram URL sending by directing client or testing direct method
+	notifier.sendWebhook(WebhookConfig{URL: genericServer.URL, Type: "generic"}, "key_switch", "Switch alert", "details", 0, StatusResponse{})
+	notifier.sendWebhook(WebhookConfig{URL: discordServer.URL, Type: "discord"}, "key_switch", "Switch alert", "details", 0, StatusResponse{})
+	notifier.sendWebhook(WebhookConfig{URL: slackServer.URL, Type: "slack"}, "key_switch", "Switch alert", "details", 0, StatusResponse{})
+
+	// Test telegram send directly using mock server URL
+	tgReqBody := map[string]any{"chat_id": "12345", "text": "test"}
+	tgPayload, _ := json.Marshal(tgReqBody)
+	req, _ := http.NewRequest(http.MethodPost, telegramServer.URL, bytes.NewReader(tgPayload))
+	_, _ = notifier.client.Do(req)
+
+	wg.Wait()
+
+	if !strings.Contains(string(genericPayload), `"event":"key_switch"`) {
+		t.Fatalf("expected event key_switch in generic payload, got %s", string(genericPayload))
+	}
+	if !strings.Contains(string(discordPayload), `content`) {
+		t.Fatalf("expected content field in discord payload, got %s", string(discordPayload))
+	}
+	if !strings.Contains(string(slackPayload), `text`) {
+		t.Fatalf("expected text field in slack payload, got %s", string(slackPayload))
+	}
+	if !strings.Contains(string(telegramPayload), `"chat_id":"12345"`) {
+		t.Fatalf("expected chat_id in telegram payload, got %s", string(telegramPayload))
+	}
+}

@@ -85,6 +85,18 @@ transformations:
   # Automatically convert OpenAI role "developer" to "system" for models that reject developer role (default: true)
   sanitize_developer_role: true
 
+alerts:
+  webhooks:
+    - url: "https://discord.com/api/webhooks/..."
+      type: "discord" # "generic", "discord", "slack"
+    - url: "https://hooks.slack.com/services/..."
+      type: "slack"
+    - url: "https://example.com/alerts/switchboard"
+      type: "generic"
+  telegram:
+    bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+    chat_id: "987654321"
+
 smtp:
   host: "smtp.example.com"
   port: 587
@@ -110,6 +122,15 @@ limits:
 - **Model Aliasing**: Configured mappings in `models.aliases` (or `MODEL_ALIASES` env) rewrite `"model"` in request payloads and augment `GET /v1/models` and `GET /models` responses.
 - **Root Endpoints**: `/responses`, `/embeddings`, `/usage`, `/chat/completions`, `/messages`, and `/models` are routed seamlessly with or without the `/v1` prefix.
 
+## Modern Alert Webhooks & Notifications
+
+Switchboard Go supports multi-destination alerts on key rotation and key exhaustion events:
+- **Discord**: Webhook formatted as rich markdown alert.
+- **Slack**: Webhook formatted as standard incoming webhook message.
+- **Telegram**: Bot API message sent to designated `chat_id`.
+- **Generic HTTP POST**: JSON payload with event type, timestamp, key index, and complete status.
+- **SMTP**: Email notifications via TLS/STARTTLS.
+
 ## Routing Strategies
 
 - **`session_sticky`** (default): Routes all requests for a session/conversation to the same upstream key as long as it has capacity (< 95% rolling usage). New sessions are assigned to the subscription key with the lowest weekly/monthly usage. Retains KV prompt caches across back-and-forth chat turns. Sessions expire after 2 hours of inactivity (`session_ttl`).
@@ -134,6 +155,13 @@ limits:
 | `USAGE_CHECK_INTERVAL` | No | `30s` | Polling frequency for upstream key quota telemetry. |
 | `PROACTIVE_SWITCH_THRESHOLD` | No | `95.0` | Rolling usage percentage at which proxy proactively rotates away from a key. |
 | `DISABLE_USAGE_POLLING` | No | `false` | Disable background usage polling. |
+| `SANITIZE_DEVELOPER_ROLE` | No | `true` | Convert `developer` role to `system` in OpenAI chat payloads. |
+| `MODEL_ALIASES` | No | | Comma-separated model aliases (`gpt-4o=glm-5.1,claude-3-7-sonnet=glm-5.1`). |
+| `WEBHOOK_URL` / `GENERIC_WEBHOOK_URL` | No | | Generic HTTP POST webhook URL for alerts. |
+| `DISCORD_WEBHOOK_URL` | No | | Discord webhook URL for alerts. |
+| `SLACK_WEBHOOK_URL` | No | | Slack incoming webhook URL for alerts. |
+| `TELEGRAM_BOT_TOKEN` | No | | Telegram bot token. |
+| `TELEGRAM_CHAT_ID` | No | | Telegram chat ID for alerts. |
 | `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. |
 | `RETRY_EXHAUSTED_AFTER` | No | `5m` | Fallback cooldown before an exhausted key is retried. `0` disables cooldown. |
 | `SMTP_HOST` | No | | SMTP host for notifications. |
