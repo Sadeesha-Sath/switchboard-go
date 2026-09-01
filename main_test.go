@@ -1496,3 +1496,52 @@ func TestWebhookAlerts(t *testing.T) {
 		t.Fatalf("expected chat_id in telegram payload, got %s", string(telegramPayload))
 	}
 }
+
+func TestPrometheusMetricsEndpoint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "test-key",
+		UpstreamAPIKeys:     []string{"k1", "k2"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024 * 1024,
+		DisableUsagePolling: true,
+	}
+	app := newApp(cfg)
+
+	// Send chat completion request
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.1"}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	// Scrape /metrics
+	reqMetrics := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recMetrics := httptest.NewRecorder()
+	app.ServeHTTP(recMetrics, reqMetrics)
+
+	if recMetrics.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /metrics, got %d", recMetrics.Code)
+	}
+	metricsOutput := recMetrics.Body.String()
+
+	if !strings.Contains(metricsOutput, "switchboard_http_requests_total") {
+		t.Fatalf("expected switchboard_http_requests_total in metrics output")
+	}
+	if !strings.Contains(metricsOutput, "switchboard_upstream_requests_total") {
+		t.Fatalf("expected switchboard_upstream_requests_total in metrics output")
+	}
+	if !strings.Contains(metricsOutput, "switchboard_key_status") {
+		t.Fatalf("expected switchboard_key_status in metrics output")
+	}
+	if !strings.Contains(metricsOutput, "switchboard_active_sessions") {
+		t.Fatalf("expected switchboard_active_sessions in metrics output")
+	}
+}

@@ -1743,11 +1743,198 @@ type ValidateKeysResponse struct {
 	Results []ValidateKeyResult `json:"results"`
 }
 
+type MetricsRegistry struct {
+	mu                       sync.RWMutex
+	httpRequestsTotal        map[string]uint64
+	httpRequestDurationSum   map[string]float64
+	httpRequestDurationCount map[string]uint64
+	httpRequestBuckets       map[string][]uint64
+
+	upstreamRequestsTotal map[string]uint64
+	upstreamDurationSum   map[string]float64
+	upstreamDurationCount map[string]uint64
+
+	keyExhaustionsTotal map[int]uint64
+	keySwitchesTotal    map[string]uint64
+}
+
+var latencyBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+func NewMetricsRegistry() *MetricsRegistry {
+	return &MetricsRegistry{
+		httpRequestsTotal:        make(map[string]uint64),
+		httpRequestDurationSum:   make(map[string]float64),
+		httpRequestDurationCount: make(map[string]uint64),
+		httpRequestBuckets:       make(map[string][]uint64),
+		upstreamRequestsTotal:    make(map[string]uint64),
+		upstreamDurationSum:      make(map[string]float64),
+		upstreamDurationCount:    make(map[string]uint64),
+		keyExhaustionsTotal:      make(map[int]uint64),
+		keySwitchesTotal:         make(map[string]uint64),
+	}
+}
+
+func (m *MetricsRegistry) RecordHTTPRequest(endpoint, method string, status int, duration float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reqKey := fmt.Sprintf(`endpoint="%s",method="%s",status="%d"`, endpoint, method, status)
+	m.httpRequestsTotal[reqKey]++
+
+	durKey := fmt.Sprintf(`endpoint="%s",method="%s"`, endpoint, method)
+	m.httpRequestDurationSum[durKey] += duration
+	m.httpRequestDurationCount[durKey]++
+
+	buckets, exists := m.httpRequestBuckets[durKey]
+	if !exists {
+		buckets = make([]uint64, len(latencyBuckets))
+	}
+	for i, bound := range latencyBuckets {
+		if duration <= bound {
+			buckets[i]++
+		}
+	}
+	m.httpRequestBuckets[durKey] = buckets
+}
+
+func (m *MetricsRegistry) RecordUpstreamRequest(keyIndex, priority, status int, duration float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reqKey := fmt.Sprintf(`key_index="%d",priority="%d",status="%d"`, keyIndex, priority, status)
+	m.upstreamRequestsTotal[reqKey]++
+
+	durKey := fmt.Sprintf(`key_index="%d"`, keyIndex)
+	m.upstreamDurationSum[durKey] += duration
+	m.upstreamDurationCount[durKey]++
+}
+
+func (m *MetricsRegistry) RecordKeyExhaustion(keyIndex int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.keyExhaustionsTotal[keyIndex]++
+}
+
+func (m *MetricsRegistry) RecordKeySwitch(fromKey, toKey int, reason string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := fmt.Sprintf(`from_key="%d",to_key="%d",reason="%s"`, fromKey, toKey, reason)
+	m.keySwitchesTotal[k]++
+}
+
+func (m *MetricsRegistry) Render(km *KeyManager) string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var sb strings.Builder
+
+	sb.WriteString("# HELP switchboard_http_requests_total Total number of HTTP requests processed.\n")
+	sb.WriteString("# TYPE switchboard_http_requests_total counter\n")
+	for k, count := range m.httpRequestsTotal {
+		sb.WriteString(fmt.Sprintf("switchboard_http_requests_total{%s} %d\n", k, count))
+	}
+
+	sb.WriteString("# HELP switchboard_http_request_duration_seconds HTTP request latency distributions.\n")
+	sb.WriteString("# TYPE switchboard_http_request_duration_seconds histogram\n")
+	for k, sum := range m.httpRequestDurationSum {
+		count := m.httpRequestDurationCount[k]
+		buckets := m.httpRequestBuckets[k]
+		for i, bound := range latencyBuckets {
+			var bCount uint64
+			if i < len(buckets) {
+				bCount = buckets[i]
+			}
+			sb.WriteString(fmt.Sprintf("switchboard_http_request_duration_seconds_bucket{%s,le=\"%g\"} %d\n", k, bound, bCount))
+		}
+		sb.WriteString(fmt.Sprintf("switchboard_http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", k, count))
+		sb.WriteString(fmt.Sprintf("switchboard_http_request_duration_seconds_sum{%s} %f\n", k, sum))
+		sb.WriteString(fmt.Sprintf("switchboard_http_request_duration_seconds_count{%s} %d\n", k, count))
+	}
+
+	sb.WriteString("# HELP switchboard_upstream_requests_total Total number of upstream requests sent.\n")
+	sb.WriteString("# TYPE switchboard_upstream_requests_total counter\n")
+	for k, count := range m.upstreamRequestsTotal {
+		sb.WriteString(fmt.Sprintf("switchboard_upstream_requests_total{%s} %d\n", k, count))
+	}
+
+	sb.WriteString("# HELP switchboard_key_exhaustions_total Total 429 quota exhaustion events per key.\n")
+	sb.WriteString("# TYPE switchboard_key_exhaustions_total counter\n")
+	for k, count := range m.keyExhaustionsTotal {
+		sb.WriteString(fmt.Sprintf("switchboard_key_exhaustions_total{key_index=\"%d\"} %d\n", k, count))
+	}
+
+	sb.WriteString("# HELP switchboard_key_switches_total Total key switch events.\n")
+	sb.WriteString("# TYPE switchboard_key_switches_total counter\n")
+	for k, count := range m.keySwitchesTotal {
+		sb.WriteString(fmt.Sprintf("switchboard_key_switches_total{%s} %d\n", k, count))
+	}
+
+	if km != nil {
+		usage := km.GetAggregatedUsage()
+
+		sb.WriteString("# HELP switchboard_key_status State of upstream key (1 for active, 0 otherwise).\n")
+		sb.WriteString("# TYPE switchboard_key_status gauge\n")
+		for _, k := range usage.Keys {
+			val := 0
+			if k.State == string(KeyAvailable) {
+				val = 1
+			}
+			sb.WriteString(fmt.Sprintf("switchboard_key_status{key_index=\"%d\",priority=\"%d\",state=\"%s\"} %d\n", k.Index, k.Priority, k.State, val))
+		}
+
+		sb.WriteString("# HELP switchboard_quota_usage_percent Key quota usage percentage.\n")
+		sb.WriteString("# TYPE switchboard_quota_usage_percent gauge\n")
+		for _, k := range usage.Keys {
+			sb.WriteString(fmt.Sprintf("switchboard_quota_usage_percent{key_index=\"%d\",window=\"rolling\"} %.2f\n", k.Index, k.Rolling.Percent))
+			sb.WriteString(fmt.Sprintf("switchboard_quota_usage_percent{key_index=\"%d\",window=\"weekly\"} %.2f\n", k.Index, k.Weekly.Percent))
+			sb.WriteString(fmt.Sprintf("switchboard_quota_usage_percent{key_index=\"%d\",window=\"monthly\"} %.2f\n", k.Index, k.Monthly.Percent))
+		}
+
+		sb.WriteString("# HELP switchboard_active_sessions Count of active in-memory sessions.\n")
+		sb.WriteString("# TYPE switchboard_active_sessions gauge\n")
+		sb.WriteString(fmt.Sprintf("switchboard_active_sessions %d\n", usage.Summary.ActiveSessions))
+	}
+
+	return sb.String()
+}
+
+type statusCaptureWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *statusCaptureWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusCaptureWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 type App struct {
-	config Config
-	keys   *KeyManager
-	client *http.Client
-	sender *AlertNotifier
+	config  Config
+	keys    *KeyManager
+	client  *http.Client
+	sender  *AlertNotifier
+	metrics *MetricsRegistry
 }
 
 func newApp(cfg Config) *App {
@@ -1786,17 +1973,31 @@ func newApp(cfg Config) *App {
 				ExpectContinueTimeout: 2 * time.Second,
 			},
 		},
-		sender: NewAlertNotifier(cfg.SMTP, cfg.Alerts),
+		sender:  NewAlertNotifier(cfg.SMTP, cfg.Alerts),
+		metrics: NewMetricsRegistry(),
 	}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	sw := &statusCaptureWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	defer func() {
+		dur := time.Since(start).Seconds()
+		a.metrics.RecordHTTPRequest(r.URL.Path, r.Method, sw.statusCode, dur)
+	}()
+
+	a.serve(sw, r)
+}
+
+func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/healthz":
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	case r.URL.Path == "/readyz":
 		a.handleReadyz(w, r)
+	case r.URL.Path == "/metrics" || r.URL.Path == "/v1/metrics" || r.URL.Path == "/admin/metrics":
+		a.handleMetrics(w, r)
 	case r.URL.Path == "/usage" || r.URL.Path == "/v1/usage" || r.URL.Path == "/admin/usage":
 		if !a.authOK(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
@@ -2063,6 +2264,16 @@ func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ValidateKeysResponse{Results: results})
 }
 
+func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(a.metrics.Render(a.keys)))
+}
+
 func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -2090,16 +2301,27 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			break
 		}
 		tried[idx] = true
+		upStart := time.Now()
 		resp, reqErr := a.doUpstream(orig, r, transformedBody, key, style)
+		upDur := time.Since(upStart).Seconds()
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
 		}
+
+		priority := 1
+		if idx < len(a.keys.priorities) {
+			priority = a.keys.priorities[idx]
+		}
+		a.metrics.RecordUpstreamRequest(idx, priority, resp.StatusCode, upDur)
+
 		if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
 			_ = resp.Body.Close()
 			a.keys.MarkExhausted(idx)
+			a.metrics.RecordKeyExhaustion(idx)
 			if a.keys.ShouldNotifySwitch(idx) {
 				a.sender.NotifySwitch(idx, a.keys.Status())
+				a.metrics.RecordKeySwitch(idx, -1, "quota_429")
 			}
 			continue
 		}

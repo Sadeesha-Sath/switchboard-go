@@ -156,21 +156,84 @@ Example response:
 }
 ```
 
+## Prometheus Metrics
+
+`GET /metrics`, `GET /v1/metrics`, or `GET /admin/metrics` returns standard Prometheus text exposition metrics for scraping by Prometheus, Grafana Agent, or VictoriaMetrics.
+
+```bash
+curl http://127.0.0.1:8080/metrics
+```
+
+Example metrics output:
+
+```text
+# HELP switchboard_http_requests_total Total number of HTTP requests processed.
+# TYPE switchboard_http_requests_total counter
+switchboard_http_requests_total{endpoint="/v1/chat/completions",method="POST",status="200"} 42
+
+# HELP switchboard_http_request_duration_seconds HTTP request latency distributions.
+# TYPE switchboard_http_request_duration_seconds histogram
+switchboard_http_request_duration_seconds_bucket{endpoint="/v1/chat/completions",method="POST",le="0.05"} 10
+switchboard_http_request_duration_seconds_bucket{endpoint="/v1/chat/completions",method="POST",le="+Inf"} 42
+switchboard_http_request_duration_seconds_sum{endpoint="/v1/chat/completions",method="POST"} 8.35
+switchboard_http_request_duration_seconds_count{endpoint="/v1/chat/completions",method="POST"} 42
+
+# HELP switchboard_upstream_requests_total Total number of upstream requests sent.
+# TYPE switchboard_upstream_requests_total counter
+switchboard_upstream_requests_total{key_index="0",priority="1",status="200"} 30
+switchboard_upstream_requests_total{key_index="1",priority="2",status="200"} 12
+
+# HELP switchboard_key_status State of upstream key (1 for active, 0 otherwise).
+# TYPE switchboard_key_status gauge
+switchboard_key_status{key_index="0",priority="1",state="available"} 1
+switchboard_key_status{key_index="1",priority="2",state="available"} 1
+
+# HELP switchboard_quota_usage_percent Key quota usage percentage.
+# TYPE switchboard_quota_usage_percent gauge
+switchboard_quota_usage_percent{key_index="0",window="rolling"} 30.00
+switchboard_quota_usage_percent{key_index="0",window="weekly"} 20.00
+switchboard_quota_usage_percent{key_index="0",window="monthly"} 10.00
+
+# HELP switchboard_active_sessions Count of active in-memory sessions.
+# TYPE switchboard_active_sessions gauge
+switchboard_active_sessions 3
+```
+
 ## Reset key manually
 
-`POST /admin/reset-key` un-exhausts a single upstream key by index, without restarting the proxy. Body: `{"index": <int>}`. Responds with the updated status.
+`POST /admin/reset-key` un-marks an exhausted key immediately and makes it
+eligible again. Useful after topping up a quota:
 
-`POST /admin/reset-all-keys` un-exhausts all upstream keys immediately. Responds with the updated status.
+```bash
+curl -X POST http://127.0.0.1:8080/admin/reset-key \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"index": 0}'
+```
 
-## Validate keys
+Returns the updated [`/admin/status`](#status) response.
 
-`POST /admin/validate-keys` actively checks every configured upstream key against
-`/models`, updates in-memory key state, and returns per-key validation results.
+## Reset all keys
+
+`POST /admin/reset-all-keys` marks all keys available immediately:
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/reset-all-keys \
+  -H "Authorization: Bearer $PROXY_API_KEY"
+```
+
+Returns the updated [`/admin/status`](#status) response.
+
+## Validate keys against upstream
+
+`POST /admin/validate-keys` sends a probe to upstream `GET /models` for every
+configured key and returns each key's state:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/admin/validate-keys \
   -H "Authorization: Bearer $PROXY_API_KEY"
 ```
+
 
 ## Health and readiness
 
