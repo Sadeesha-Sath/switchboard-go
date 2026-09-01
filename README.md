@@ -22,12 +22,16 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
   requests
 - One proxy API key for your tools
 - Multiple upstream OpenCode Go keys behind the scenes
+- **Key Priority Tiers & Traffic Weighting**: Primary vs backup key tiers and smooth weighted traffic distribution
+- **Request Transformation & Compatibility**: Automatic `developer` $\rightarrow$ `system` role sanitization, model name aliasing, and root endpoint support (`/responses`, `/embeddings`, `/usage`)
+- **Modern Alert Webhooks**: Instant alerts to Discord, Slack, Telegram, generic JSON webhooks, and SMTP
+- **Prometheus Metrics (`/metrics`)**: Production-ready exposition endpoint tracking requests, durations, key statuses, switches, 429s, and quota usage
+- **Dynamic Configuration Reloading (`/admin/reload`, `SIGHUP`)**: Hot-reload keys, priorities, weights, aliases, and webhooks in-memory without downtime
 - **Aggregated Quota Endpoint (`/usage`, `/v1/usage`)**: Compatible with OpenCode widget tools (Waybar, Polybar, VS Code) while exposing full pool metrics
 - **Multi-Strategy Routing**: `session_sticky` (default) preserves upstream KV prompt caching across agent turns; `balanced`, `round_robin`, and `fill_first` also available
 - **Proactive Quota Switching**: Automatically switches away from subscriptions at $\ge 95\%$ capacity before hitting 429 errors
 - **Dynamic Reset Cooldown & Recovery**: Keys cool down until their exact upstream `resetsAt` and automatically recover when quota resets
 - Automatic failover when an upstream key is exhausted
-- Optional YAML config, Docker, admin status, and SMTP alerts
 
 ## Install
 
