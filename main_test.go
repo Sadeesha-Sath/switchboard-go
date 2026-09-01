@@ -1254,3 +1254,170 @@ upstream:
 		t.Fatalf("unexpected key config 1: %+v", cfg.UpstreamKeyConfigs[1])
 	}
 }
+
+func TestAutomaticRoleSanitization(t *testing.T) {
+	var receivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hello"}}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:           "test-key",
+		UpstreamAPIKeys:       []string{"k1"},
+		UpstreamBaseURL:       upstream.URL,
+		MaxRequestBodyBytes:   1024 * 1024,
+		DisableUsagePolling:   true,
+		SanitizeDeveloperRole: true,
+	}
+	app := newApp(cfg)
+
+	reqPayload := `{"model":"glm-5.1","messages":[{"role":"developer","content":"You are a helpful assistant"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqPayload))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(receivedBody, &parsed); err != nil {
+		t.Fatalf("failed to parse upstream body: %v", err)
+	}
+	msgs := parsed["messages"].([]any)
+	firstMsg := msgs[0].(map[string]any)
+	if firstMsg["role"] != "system" {
+		t.Fatalf("expected role to be rewritten to 'system', got %s", firstMsg["role"])
+	}
+}
+
+func TestModelAliasingInRequest(t *testing.T) {
+	var receivedModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqData map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&reqData)
+		if m, ok := reqData["model"].(string); ok {
+			receivedModel = m
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "test-key",
+		UpstreamAPIKeys:     []string{"k1"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024 * 1024,
+		DisableUsagePolling: true,
+		ModelAliases: map[string]string{
+			"gpt-4o":            "glm-5.1",
+			"claude-3-7-sonnet": "minimax-m3",
+		},
+	}
+	app := newApp(cfg)
+
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqPayload))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if receivedModel != "glm-5.1" {
+		t.Fatalf("expected model to be aliased to glm-5.1, got %s", receivedModel)
+	}
+}
+
+func TestModelAliasingInModelsEndpoint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"glm-5.1","object":"model"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "test-key",
+		UpstreamAPIKeys:     []string{"k1"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024 * 1024,
+		DisableUsagePolling: true,
+		ModelAliases: map[string]string{
+			"gpt-4o": "glm-5.1",
+		},
+	}
+	app := newApp(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("failed to unmarshal models response: %v", err)
+	}
+	dataList := body["data"].([]any)
+	foundAlias := false
+	for _, item := range dataList {
+		m := item.(map[string]any)
+		if m["id"] == "gpt-4o" {
+			foundAlias = true
+		}
+	}
+	if !foundAlias {
+		t.Fatalf("expected alias gpt-4o to be present in /v1/models response, got %+v", dataList)
+	}
+}
+
+func TestMissingRootEndpoints(t *testing.T) {
+	var requestedPaths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPaths = append(requestedPaths, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey:         "test-key",
+		UpstreamAPIKeys:     []string{"k1"},
+		UpstreamBaseURL:     upstream.URL,
+		MaxRequestBodyBytes: 1024 * 1024,
+		DisableUsagePolling: true,
+	}
+	app := newApp(cfg)
+
+	// 1. /responses
+	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /responses, got %d", rec.Code)
+	}
+
+	// 2. /embeddings
+	req = httptest.NewRequest(http.MethodPost, "/embeddings", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /embeddings, got %d", rec.Code)
+	}
+
+	if len(requestedPaths) != 2 || requestedPaths[0] != "/responses" || requestedPaths[1] != "/embeddings" {
+		t.Fatalf("unexpected forwarded upstream paths: %+v", requestedPaths)
+	}
+}

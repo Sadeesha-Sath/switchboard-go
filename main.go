@@ -80,6 +80,9 @@ type Config struct {
 	DisableUsagePolling      bool
 	ConfigSourcePath         string
 
+	ModelAliases          map[string]string
+	SanitizeDeveloperRole bool
+
 	SMTP SMTPConfig
 }
 
@@ -129,6 +132,8 @@ func defaultConfig() Config {
 		UsageCheckInterval:       30 * time.Second,
 		ProactiveSwitchThreshold: 95.0,
 		DisableUsagePolling:      false,
+		ModelAliases:             make(map[string]string),
+		SanitizeDeveloperRole:    true,
 		SMTP:                     SMTPConfig{Port: 25},
 	}
 }
@@ -170,6 +175,12 @@ type yamlConfig struct {
 		ProactiveSwitchThreshold *float64      `yaml:"proactive_switch_threshold"`
 		DisableUsagePolling      *bool         `yaml:"disable_usage_polling"`
 	} `yaml:"upstream"`
+	Models struct {
+		Aliases map[string]string `yaml:"aliases"`
+	} `yaml:"models"`
+	Transformations struct {
+		SanitizeDeveloperRole *bool `yaml:"sanitize_developer_role"`
+	} `yaml:"transformations"`
 	SMTP struct {
 		Host     string `yaml:"host"`
 		Username string `yaml:"username"`
@@ -270,6 +281,17 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 	}
 
+	sanitizeRole := true
+	if yc.Transformations.SanitizeDeveloperRole != nil {
+		sanitizeRole = *yc.Transformations.SanitizeDeveloperRole
+	}
+	modelAliases := make(map[string]string)
+	for k, v := range yc.Models.Aliases {
+		if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+			modelAliases[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+
 	return Config{
 		ListenAddr:               yc.Server.ListenAddr,
 		UpstreamBaseURL:          yc.Upstream.BaseURL,
@@ -284,6 +306,8 @@ func loadYAMLConfig(path string) (Config, error) {
 		UsageCheckInterval:       usageInterval,
 		ProactiveSwitchThreshold: proactiveThreshold,
 		DisableUsagePolling:      disablePolling,
+		ModelAliases:             modelAliases,
+		SanitizeDeveloperRole:    sanitizeRole,
 		SMTP: SMTPConfig{
 			Host:     yc.SMTP.Host,
 			Port:     yc.SMTP.Port,
@@ -339,6 +363,15 @@ func mergeConfig(dst *Config, src Config) {
 		dst.ProactiveSwitchThreshold = src.ProactiveSwitchThreshold
 	}
 	dst.DisableUsagePolling = src.DisableUsagePolling || dst.DisableUsagePolling
+	if len(src.ModelAliases) > 0 {
+		if dst.ModelAliases == nil {
+			dst.ModelAliases = make(map[string]string)
+		}
+		for k, v := range src.ModelAliases {
+			dst.ModelAliases[k] = v
+		}
+	}
+	dst.SanitizeDeveloperRole = src.SanitizeDeveloperRole
 	if src.SMTP.Host != "" {
 		dst.SMTP.Host = src.SMTP.Host
 	}
@@ -459,6 +492,24 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("DISABLE_USAGE_POLLING"); v != "" {
 		cfg.DisableUsagePolling = parseBool(v)
+	}
+	if v := os.Getenv("SANITIZE_DEVELOPER_ROLE"); v != "" {
+		cfg.SanitizeDeveloperRole = parseBool(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("MODEL_ALIASES")); v != "" {
+		if cfg.ModelAliases == nil {
+			cfg.ModelAliases = make(map[string]string)
+		}
+		for _, pair := range strings.Split(v, ",") {
+			parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+			if len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				if k != "" && val != "" {
+					cfg.ModelAliases[k] = val
+				}
+			}
+		}
 	}
 	if v := os.Getenv("SMTP_HOST"); v != "" {
 		cfg.SMTP.Host = v
@@ -1743,7 +1794,7 @@ func isProxyPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "/models", "/chat/completions", "/messages", "/complete":
+	case "/models", "/chat/completions", "/messages", "/complete", "/responses", "/embeddings":
 		return true
 	default:
 		return false
@@ -1977,6 +2028,10 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	orig := r.Context()
 
 	sessionID := extractSessionID(r, body)
+	transformedBody := a.transformRequestBody(body, style == APIStyleAnthropic)
+
+	isModelsEndpoint := (r.URL.Path == "/models" || r.URL.Path == "/v1/models") && r.Method == http.MethodGet
+
 	tried := make(map[int]bool)
 
 	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
@@ -1985,7 +2040,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			break
 		}
 		tried[idx] = true
-		resp, reqErr := a.doUpstream(orig, r, body, key, style)
+		resp, reqErr := a.doUpstream(orig, r, transformedBody, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
@@ -2002,6 +2057,27 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		// recovered (previously exhausted) key un-sticks and the notification
 		// flags re-arm for the next depletion round.
 		a.keys.MarkAvailable(idx)
+
+		if isModelsEndpoint && len(a.config.ModelAliases) > 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			respBody, rErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if rErr == nil {
+				respBody = a.augmentModelsResponse(respBody)
+			}
+			for k, vv := range resp.Header {
+				if strings.EqualFold(k, "Content-Length") {
+					continue
+				}
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(respBody)
+			return
+		}
+
 		copyResponse(w, resp)
 		return
 	}
@@ -2016,10 +2092,84 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
 }
 
+func (a *App) transformRequestBody(body []byte, isAnthropic bool) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body
+	}
+	mutated := false
+
+	if m, ok := raw["model"].(string); ok && len(a.config.ModelAliases) > 0 {
+		if target, exists := a.config.ModelAliases[m]; exists && target != "" {
+			raw["model"] = target
+			mutated = true
+		}
+	}
+
+	if !isAnthropic && a.config.SanitizeDeveloperRole {
+		if msgs, ok := raw["messages"].([]any); ok {
+			for _, item := range msgs {
+				if msgObj, ok := item.(map[string]any); ok {
+					if role, ok := msgObj["role"].(string); ok && strings.EqualFold(role, "developer") {
+						msgObj["role"] = "system"
+						mutated = true
+					}
+				}
+			}
+		}
+	}
+
+	if !mutated {
+		return body
+	}
+	newBody, err := json.Marshal(raw)
+	if err != nil {
+		return body
+	}
+	return newBody
+}
+
+func (a *App) augmentModelsResponse(body []byte) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	dataList, ok := obj["data"].([]any)
+	if !ok {
+		return body
+	}
+	existing := make(map[string]bool)
+	for _, item := range dataList {
+		if m, ok := item.(map[string]any); ok {
+			if id, ok := m["id"].(string); ok {
+				existing[id] = true
+			}
+		}
+	}
+	for alias := range a.config.ModelAliases {
+		if !existing[alias] {
+			dataList = append(dataList, map[string]any{
+				"id":       alias,
+				"object":   "model",
+				"created":  time.Now().Unix(),
+				"owned_by": "switchboard-alias",
+			})
+		}
+	}
+	obj["data"] = dataList
+	if augmented, err := json.Marshal(obj); err == nil {
+		return augmented
+	}
+	return body
+}
+
 func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key string, apiStyle APIStyle) (*http.Response, error) {
 	path := strings.TrimPrefix(r.URL.EscapedPath(), "/v1")
-	if path == "" {
-		path = "/"
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
 	u := a.config.UpstreamBaseURL + path
 	if r.URL.RawQuery != "" {
@@ -2029,7 +2179,9 @@ func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key 
 	if err != nil {
 		return nil, err
 	}
+	req.ContentLength = int64(len(body))
 	copyHeaders(req.Header, r.Header)
+	req.Header.Del("Content-Length")
 	if apiStyle == APIStyleAnthropic {
 		req.Header.Set("x-api-key", key)
 		if strings.TrimSpace(req.Header.Get("anthropic-version")) == "" {

@@ -73,6 +73,18 @@ upstream:
   # Fallback cooldown before an exhausted key is retried if resetsAt is unavailable (default: 5m)
   retry_exhausted_after: "5m"
 
+# Model aliasing: seamlessly maps requested model IDs to upstream models
+models:
+  aliases:
+    "gpt-4o": "glm-5.1"
+    "gpt-4o-mini": "minimax-m3"
+    "claude-3-7-sonnet": "glm-5.1"
+
+# Request transformations
+transformations:
+  # Automatically convert OpenAI role "developer" to "system" for models that reject developer role (default: true)
+  sanitize_developer_role: true
+
 smtp:
   host: "smtp.example.com"
   port: 587
@@ -91,6 +103,12 @@ limits:
 
 - **Priority Tiers (`priority`)**: `1` (primary, default), `2` (backup), etc. Keys in higher priority tiers are exhausted or saturated before traffic falls back to lower priority backup tiers.
 - **Traffic Weighting (`weight`)**: Relative weight for traffic distribution (default: `1`). Under `round_robin`, traffic is smoothly interleaved according to relative weights (e.g. `3:1` sends 75% of requests to weight-3 keys). Under `session_sticky`, higher weighted keys receive proportional preference when new sessions are assigned.
+
+## Request Transformation & Compatibility
+
+- **Automatic Developer Role Sanitization**: When enabled (`sanitize_developer_role: true`, default `true`), messages with `role: "developer"` in OpenAI chat completion payloads are rewritten to `role: "system"`.
+- **Model Aliasing**: Configured mappings in `models.aliases` (or `MODEL_ALIASES` env) rewrite `"model"` in request payloads and augment `GET /v1/models` and `GET /models` responses.
+- **Root Endpoints**: `/responses`, `/embeddings`, `/usage`, `/chat/completions`, `/messages`, and `/models` are routed seamlessly with or without the `/v1` prefix.
 
 ## Routing Strategies
 
