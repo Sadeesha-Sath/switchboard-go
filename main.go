@@ -161,9 +161,8 @@ func resolveConfigPath() (string, bool, error) {
 		}
 		return explicit, true, nil
 	}
-	home, _ := os.UserHomeDir()
-	paths := []string{}
-	if home != "" {
+	paths := []string{"config.yaml", "config.yml"}
+	if home, _ := os.UserHomeDir(); home != "" {
 		paths = append(paths, filepath.Join(home, ".config", "switchboard-go", "config.yaml"))
 	}
 	paths = append(paths, "/etc/switchboard-go/config.yaml")

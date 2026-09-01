@@ -5,4 +5,5 @@ config.yml
 .DS_Store
 .worktrees/
 node_modules/
+.openchamber/
 !web/dashboard/dist/

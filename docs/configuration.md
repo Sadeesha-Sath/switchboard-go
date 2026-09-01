@@ -17,9 +17,10 @@ deployment platform.
 Switchboard Go looks for a config file in this order:
 
 1. `SWITCHBOARD_GO_CONFIG`, if set
-2. `~/.config/switchboard-go/config.yaml`, if it exists
-3. `/etc/switchboard-go/config.yaml`, if it exists
-4. No config file
+2. `./config.yaml` or `./config.yml` (current working directory), if it exists
+3. `~/.config/switchboard-go/config.yaml`, if it exists
+4. `/etc/switchboard-go/config.yaml`, if it exists
+5. No config file
 
 If `SWITCHBOARD_GO_CONFIG` is set, the file must exist and be valid YAML.
 Missing or invalid explicit config files are startup errors.

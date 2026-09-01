@@ -1,0 +1,84 @@
+# Switchboard Go Configuration Example
+# Documentation: docs/configuration.md
+#
+# Copy this file to config.yaml (or ~/.config/switchboard-go/config.yaml) and update with your keys.
+
+server:
+  listen_addr: "127.0.0.1:8080"
+  proxy_api_key: "replace-with-a-long-random-local-key"
+
+upstream:
+  base_url: "https://opencode.ai/zen/go/v1"
+  api_keys:
+    # Plain key strings:
+    # - "sk-first"
+    # Or structured key entries with priority tiers (1 = primary, 2+ = backup) and traffic weights:
+    - key: "sk-primary-key-1"
+      priority: 1
+      weight: 1
+    - key: "sk-primary-key-2"
+      priority: 1
+      weight: 1
+    # - key: "sk-backup-key"
+    #   priority: 2
+    #   weight: 1
+
+  # Routing strategy: "session_sticky" (default), "balanced", "round_robin", "fill_first"
+  routing_strategy: "session_sticky"
+
+  # How long an idle session retains its assigned key before re-evaluating (default: 2h)
+  session_ttl: "2h"
+
+  # In balanced mode, max idle gap before switching to a key with lower quota (default: 1h)
+  balanced_idle_timeout: "1h"
+
+  # Upstream /usage polling interval for quota tracking and automatic recovery (default: 30s)
+  usage_check_interval: "30s"
+
+  # Rolling window percent threshold at which the proxy proactively rotates keys (default: 95.0)
+  proactive_switch_threshold: 95.0
+
+  # Disable background usage polling (default: false)
+  disable_usage_polling: false
+
+  # Fallback cooldown before an exhausted key is retried if resetsAt is unavailable (default: 5m)
+  retry_exhausted_after: "5m"
+
+# Model aliasing: seamlessly maps requested model IDs to upstream models
+models:
+  aliases:
+    "gpt-4o": "glm-5.1"
+    "gpt-4o-mini": "minimax-m3"
+    "claude-3-7-sonnet": "glm-5.1"
+
+# Request transformations
+transformations:
+  # Automatically convert OpenAI role "developer" to "system" for models that reject developer role (default: true)
+  sanitize_developer_role: true
+
+# Alerts (optional)
+# alerts:
+#   webhooks:
+#     - url: "https://discord.com/api/webhooks/..."
+#       type: "discord"
+#     - url: "https://hooks.slack.com/services/..."
+#       type: "slack"
+#     - url: "https://example.com/alerts/switchboard"
+#       type: "generic"
+#   telegram:
+#     bot_token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+#     chat_id: "987654321"
+
+# SMTP notifications (optional)
+# smtp:
+#   host: "smtp.example.com"
+#   port: 587
+#   username: "alerts@example.com"
+#   password: "your-smtp-password"
+#   from: "alerts@example.com"
+#   to: "you@example.com"
+#   tls: false
+#   starttls: true
+
+limits:
+  max_request_body_bytes: 20971520
