@@ -1642,3 +1642,98 @@ upstream:
 		t.Fatalf("expected strategy balanced, got %s", app.keys.routingStrategy)
 	}
 }
+
+func TestWorkspaceUsageConfigParsing(t *testing.T) {
+	yaml := `
+server:
+  proxy_api_key: "k"
+  dashboard_auto_key: "false"
+upstream:
+  api_keys: ["sk-1"]
+workspace_usage:
+  session_cookie: "Fe26.2**test"
+  workspace_ids: ["wrk_a", "wrk_b"]
+  interval: "90s"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadYAMLConfig(path)
+	if err != nil {
+		t.Fatalf("loadYAMLConfig: %v", err)
+	}
+	if cfg.WorkspaceUsage.SessionCookie != "Fe26.2**test" {
+		t.Fatalf("session cookie = %q", cfg.WorkspaceUsage.SessionCookie)
+	}
+	if len(cfg.WorkspaceUsage.WorkspaceIDs) != 2 || cfg.WorkspaceUsage.WorkspaceIDs[1] != "wrk_b" {
+		t.Fatalf("workspace ids = %v", cfg.WorkspaceUsage.WorkspaceIDs)
+	}
+	if cfg.WorkspaceUsage.Interval != 90*time.Second {
+		t.Fatalf("interval = %v", cfg.WorkspaceUsage.Interval)
+	}
+	if cfg.DashboardAutoKey != "false" {
+		t.Fatalf("dashboard_auto_key = %q", cfg.DashboardAutoKey)
+	}
+}
+
+func TestWorkspaceUsageConfigDefaultsAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  proxy_api_key: \"k\"\nupstream:\n  api_keys: [\"sk-1\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadYAMLConfig(path)
+	if err != nil {
+		t.Fatalf("loadYAMLConfig: %v", err)
+	}
+	if cfg.WorkspaceUsage.Interval != -1 {
+		t.Fatalf("unset interval should be -1 sentinel, got %v", cfg.WorkspaceUsage.Interval)
+	}
+	base := defaultConfig()
+	mergeConfig(&base, cfg)
+	if base.WorkspaceUsage.Interval != 60*time.Second {
+		t.Fatalf("merged interval = %v, want default 60s", base.WorkspaceUsage.Interval)
+	}
+	t.Setenv("WORKSPACE_USAGE_INTERVAL", "bogus")
+	applyEnvOverrides(&base)
+	if base.WorkspaceUsage.Interval != 60*time.Second {
+		t.Fatalf("bogus env must not clobber interval, got %v", base.WorkspaceUsage.Interval)
+	}
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+
+	bad := base
+	bad.WorkspaceUsage.Interval = -1
+	if err := validateConfig(bad); err == nil {
+		t.Fatal("expected validation error for negative interval")
+	}
+	badAuto := base
+	badAuto.DashboardAutoKey = "sometimes"
+	if err := validateConfig(badAuto); err == nil {
+		t.Fatal("expected validation error for invalid dashboard_auto_key")
+	}
+}
+
+func TestWorkspaceUsageEnvOverrides(t *testing.T) {
+	base := defaultConfig()
+	t.Setenv("OPENCODE_SESSION_COOKIE", "cookie-value")
+	t.Setenv("OPENCODE_WORKSPACE_IDS", "wrk_a, wrk_b")
+	t.Setenv("WORKSPACE_USAGE_INTERVAL", "5s")
+	t.Setenv("DASHBOARD_AUTO_KEY", "true")
+	applyEnvOverrides(&base)
+	if base.WorkspaceUsage.SessionCookie != "cookie-value" {
+		t.Fatalf("cookie = %q", base.WorkspaceUsage.SessionCookie)
+	}
+	if len(base.WorkspaceUsage.WorkspaceIDs) != 2 || base.WorkspaceUsage.WorkspaceIDs[0] != "wrk_a" {
+		t.Fatalf("ids = %v", base.WorkspaceUsage.WorkspaceIDs)
+	}
+	if base.WorkspaceUsage.Interval != 5*time.Second {
+		t.Fatalf("interval = %v", base.WorkspaceUsage.Interval)
+	}
+	if base.DashboardAutoKey != "true" {
+		t.Fatalf("dashboard auto key = %q", base.DashboardAutoKey)
+	}
+}

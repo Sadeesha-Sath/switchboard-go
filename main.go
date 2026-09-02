@@ -100,6 +100,16 @@ type Config struct {
 
 	Alerts AlertConfig
 	SMTP   SMTPConfig
+
+	DashboardAutoKey string
+
+	WorkspaceUsage WorkspaceUsageConfig
+}
+
+type WorkspaceUsageConfig struct {
+	SessionCookie string
+	WorkspaceIDs  []string
+	Interval      time.Duration
 }
 
 type SMTPConfig struct {
@@ -151,6 +161,8 @@ func defaultConfig() Config {
 		ModelAliases:             make(map[string]string),
 		SanitizeDeveloperRole:    true,
 		SMTP:                     SMTPConfig{Port: 25},
+		DashboardAutoKey:         "auto",
+		WorkspaceUsage:           WorkspaceUsageConfig{Interval: 60 * time.Second},
 	}
 }
 
@@ -176,8 +188,9 @@ func resolveConfigPath() (string, bool, error) {
 
 type yamlConfig struct {
 	Server struct {
-		ListenAddr  string `yaml:"listen_addr"`
-		ProxyAPIKey string `yaml:"proxy_api_key"`
+		ListenAddr       string `yaml:"listen_addr"`
+		ProxyAPIKey      string `yaml:"proxy_api_key"`
+		DashboardAutoKey string `yaml:"dashboard_auto_key"`
 	} `yaml:"server"`
 	Upstream struct {
 		BaseURL                  string        `yaml:"base_url"`
@@ -213,6 +226,11 @@ type yamlConfig struct {
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
+	WorkspaceUsage struct {
+		SessionCookie string   `yaml:"session_cookie"`
+		WorkspaceIDs  []string `yaml:"workspace_ids"`
+		Interval      string   `yaml:"interval"`
+	} `yaml:"workspace_usage"`
 }
 
 func loadYAMLConfig(path string) (Config, error) {
@@ -271,6 +289,24 @@ func loadYAMLConfig(path string) (Config, error) {
 			return Config{}, fmt.Errorf("usage_check_interval must be >= 0")
 		}
 		usageInterval = d
+	}
+
+	wsInterval := time.Duration(-1)
+	if s := strings.TrimSpace(yc.WorkspaceUsage.Interval); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse workspace_usage.interval: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("workspace_usage.interval must be >= 0")
+		}
+		wsInterval = d
+	}
+	wsIDs := make([]string, 0, len(yc.WorkspaceUsage.WorkspaceIDs))
+	for _, id := range yc.WorkspaceUsage.WorkspaceIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			wsIDs = append(wsIDs, id)
+		}
 	}
 
 	proactiveThreshold := -1.0
@@ -333,6 +369,12 @@ func loadYAMLConfig(path string) (Config, error) {
 		ModelAliases:             modelAliases,
 		SanitizeDeveloperRole:    sanitizeRole,
 		Alerts:                   alerts,
+		DashboardAutoKey:         yc.Server.DashboardAutoKey,
+		WorkspaceUsage: WorkspaceUsageConfig{
+			SessionCookie: strings.TrimSpace(yc.WorkspaceUsage.SessionCookie),
+			WorkspaceIDs:  wsIDs,
+			Interval:      wsInterval,
+		},
 		SMTP: SMTPConfig{
 			Host:     yc.SMTP.Host,
 			Port:     yc.SMTP.Port,
@@ -423,6 +465,18 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	dst.SMTP.TLS = src.SMTP.TLS || dst.SMTP.TLS
 	dst.SMTP.StartTLS = src.SMTP.StartTLS || dst.SMTP.StartTLS
+	if src.DashboardAutoKey != "" {
+		dst.DashboardAutoKey = src.DashboardAutoKey
+	}
+	if src.WorkspaceUsage.SessionCookie != "" {
+		dst.WorkspaceUsage.SessionCookie = src.WorkspaceUsage.SessionCookie
+	}
+	if len(src.WorkspaceUsage.WorkspaceIDs) > 0 {
+		dst.WorkspaceUsage.WorkspaceIDs = append([]string(nil), src.WorkspaceUsage.WorkspaceIDs...)
+	}
+	if src.WorkspaceUsage.Interval >= 0 {
+		dst.WorkspaceUsage.Interval = src.WorkspaceUsage.Interval
+	}
 }
 
 func parseCommaInts(s string) []int {
@@ -586,6 +640,28 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("SMTP_STARTTLS"); v != "" {
 		cfg.SMTP.StartTLS = parseBool(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_SESSION_COOKIE")); v != "" {
+		cfg.WorkspaceUsage.SessionCookie = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_WORKSPACE_IDS")); v != "" {
+		var ids []string
+		for _, id := range strings.Split(v, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			cfg.WorkspaceUsage.WorkspaceIDs = ids
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WORKSPACE_USAGE_INTERVAL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cfg.WorkspaceUsage.Interval = d
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("DASHBOARD_AUTO_KEY")); v != "" {
+		cfg.DashboardAutoKey = v
+	}
 }
 
 func defaultString(v, d string) string {
@@ -627,13 +703,21 @@ func validateConfig(cfg Config) error {
 	if strategy != "" && strategy != "session_sticky" && strategy != "balanced" && strategy != "round_robin" && strategy != "fill_first" {
 		return fmt.Errorf("invalid ROUTING_STRATEGY: %q (must be one of: session_sticky, balanced, round_robin, fill_first)", cfg.RoutingStrategy)
 	}
+	if cfg.WorkspaceUsage.Interval < 0 {
+		return errors.New("WORKSPACE_USAGE_INTERVAL must be >= 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.DashboardAutoKey)) {
+	case "", "auto", "true", "false":
+	default:
+		return fmt.Errorf("dashboard_auto_key must be one of: auto, true, false")
+	}
 	return nil
 }
 
 func safeConfigSummary(cfg Config) string {
 	strategy := defaultString(cfg.RoutingStrategy, "session_sticky")
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d strategy=%s session_ttl=%s balanced_idle_timeout=%s usage_check_interval=%s proactive_threshold=%.1f%% polling_disabled=%t smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s",
-		cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), strategy, cfg.SessionTTL, cfg.BalancedIdleTimeout, cfg.UsageCheckInterval, cfg.ProactiveSwitchThreshold, cfg.DisableUsagePolling, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
+	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d strategy=%s session_ttl=%s balanced_idle_timeout=%s usage_check_interval=%s proactive_threshold=%.1f%% polling_disabled=%t smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s workspace_usage=%t dashboard_auto_key=%s",
+		cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), strategy, cfg.SessionTTL, cfg.BalancedIdleTimeout, cfg.UsageCheckInterval, cfg.ProactiveSwitchThreshold, cfg.DisableUsagePolling, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, len(cfg.WorkspaceUsage.SessionCookie) > 0, defaultString(cfg.DashboardAutoKey, "auto"))
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
