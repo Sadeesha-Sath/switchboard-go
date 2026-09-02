@@ -136,6 +136,9 @@ func (p *serovalParser) parseObject() (any, error) {
 			p.pos++
 			return obj, nil
 		}
+		if p.pos >= len(p.s) {
+			return nil, fmt.Errorf("seroval: unexpected end of input in object")
+		}
 		var key string
 		if q := p.s[p.pos]; q == '"' || q == '\'' {
 			k, err := p.parseString(q)

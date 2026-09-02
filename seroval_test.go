@@ -64,5 +64,55 @@ func TestParseSerovalStreamMultiFrameAndStrings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseSerovalStream: %v", err)
 	}
-	_ = got // multi-frame bodies only occur per-call; frames concat to one payload in practice
+	if got == nil {
+		t.Fatalf("got nil, want non-nil root")
+	}
+}
+
+func TestParseSerovalStreamEscapes(t *testing.T) {
+	payload := wrapServerFn("server-fn:esc", `{msg:"line\nbreak \"quoted\"",uni:"\u0041",tab:"a\tb",bs:"a\\b"}`)
+	got, err := parseSerovalStream(frame(payload))
+	if err != nil {
+		t.Fatalf("parseSerovalStream: %v", err)
+	}
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("root = %T, want map", got)
+	}
+	if m["msg"] != "line\nbreak \"quoted\"" {
+		t.Fatalf("msg = %#v, want %q", m["msg"], "line\nbreak \"quoted\"")
+	}
+	if m["uni"] != "A" {
+		t.Fatalf("uni = %#v, want %q", m["uni"], "A")
+	}
+	if m["tab"] != "a\tb" {
+		t.Fatalf("tab = %#v, want %q", m["tab"], "a\tb")
+	}
+	if m["bs"] != "a\\b" {
+		t.Fatalf("bs = %#v, want %q", m["bs"], "a\\b")
+	}
+}
+
+func TestParseSerovalStreamTruncatedAndBadFrame(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "truncated after {", body: ";0x00000007;$R[0]={"},
+		{name: "truncated after trailing comma", body: frame("$R[0]={a:1,")},
+		{name: "bad frame header", body: "not-a-frame"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic on %q: %v", tc.name, r)
+				}
+			}()
+			_, err := parseSerovalStream(tc.body)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.name)
+			}
+		})
+	}
 }
