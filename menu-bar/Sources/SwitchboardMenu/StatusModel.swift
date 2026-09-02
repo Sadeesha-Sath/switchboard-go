@@ -27,13 +27,18 @@ public final class StatusModel: ObservableObject {
 
     public let api: APIServing
     private let notifier: Notifying
-    public var interval: TimeInterval
+    @Published public var pollInterval: TimeInterval {
+        didSet {
+            guard pollInterval != oldValue else { return }
+            restartTimer()
+        }
+    }
     private var timer: Timer?
 
     public init(api: APIServing, notifier: Notifying, interval: TimeInterval = 30) {
         self.api = api
         self.notifier = notifier
-        self.interval = interval
+        self.pollInterval = interval
     }
 
     public func refresh(force: Bool = false) async {
@@ -55,13 +60,18 @@ public final class StatusModel: ObservableObject {
         }
     }
 
-    public func startPolling() {
-        guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+    private func restartTimer() {
+        stopPolling()
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.refresh()
             }
         }
+    }
+
+    public func startPolling() {
+        guard timer == nil else { return }
+        restartTimer()
         Task { await refresh() }
     }
 
