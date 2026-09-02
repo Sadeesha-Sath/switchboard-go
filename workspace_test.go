@@ -147,3 +147,37 @@ func TestWorkspaceClientUnauthorized(t *testing.T) {
 		t.Fatalf("expected snapshot.Error to be set: %+v", snap)
 	}
 }
+
+func TestWorkspaceClientRetriesAfterServerError(t *testing.T) {
+	fail := atomic.Bool{}
+	fail.Store(true)
+	srv := newWorkspaceTestServer(t, &fail)
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh should self-heal after a 500: %v", err)
+	}
+	snap := c.Snapshot()
+	if snap.Error != "" || len(snap.Workspaces) != 2 {
+		t.Fatalf("snapshot after retry = %+v", snap)
+	}
+}
+
+func TestWorkspaceClientDiscoveryFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<html><body>no scripts here</body></html>`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
+	if err := c.Refresh(context.Background()); err == nil {
+		t.Fatal("expected discovery failure error")
+	}
+	snap := c.Snapshot()
+	if !snap.Enabled || snap.Error == "" {
+		t.Fatalf("snapshot should stay enabled with error set: %+v", snap)
+	}
+}
