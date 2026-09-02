@@ -6,6 +6,9 @@
 server:
   listen_addr: "127.0.0.1:8080"
   proxy_api_key: "replace-with-a-long-random-local-key"
+  # Dashboard first-load proxy key: "auto" (default) embeds the key only when
+  # listen_addr is loopback; "true" always; "false" never.
+  dashboard_auto_key: "auto"
 
 upstream:
   base_url: "https://opencode.ai/zen/go/v1"
@@ -43,6 +46,17 @@ upstream:
 
   # Fallback cooldown before an exhausted key is retried if resetsAt is unavailable (default: 5m)
   retry_exhausted_after: "5m"
+
+# OpenCode workspace usage (optional) — per-model cost & quota breakdown from
+# the console, shown in the dashboard. Feature is off when session_cookie is empty.
+# workspace_usage:
+#   # Session cookie from opencode.ai (DevTools -> Application -> Cookies -> "auth")
+#   session_cookie: ""
+#   # Optional: restrict to specific workspace IDs (default: auto-discover all)
+#   # workspace_ids:
+#   #   - "wrk_01M1CDMTPY3W0AGGKXZA0147N5"
+#   # Polling interval (default: 60s)
+#   interval: "60s"
 
 # Model aliasing: seamlessly maps requested model IDs to upstream models
 models:

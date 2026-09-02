@@ -29,6 +29,7 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - **Dynamic Configuration Reloading (`/admin/reload`, `SIGHUP`)**: Hot-reload keys, priorities, weights, aliases, and webhooks in-memory without downtime
 - **Aggregated Quota Endpoint (`/usage`, `/v1/usage`)**: Compatible with OpenCode widget tools (Waybar, Polybar, VS Code) while exposing full pool metrics
 - **Built-in Web Dashboard (`/dashboard`)**: Local UI for per-key quota, pool usage, live metrics, and admin actions (validate, reset, reload)
+- **Per-Model Workspace Usage**: per-model USD cost and quota contribution (5h/weekly/monthly) per workspace, scraped from the OpenCode console into the dashboard
 - **macOS Menu Bar App (`menu-bar/`)**: Native live status, notifications on key exhaustion, and admin actions; build with `swift build -c release` (see [docs/menubar.md](docs/menubar.md))
 - **Multi-Strategy Routing**: `session_sticky` (default) preserves upstream KV prompt caching across agent turns; `balanced`, `round_robin`, and `fill_first` also available
 - **Proactive Quota Switching**: Automatically switches away from subscriptions at $\ge 95\%$ capacity before hitting 429 errors
@@ -132,7 +133,7 @@ http://127.0.0.1:8080/dashboard/
 It shows per-key quota windows (rolling/weekly/monthly), pool aggregates, key
 states and cooldowns, live request/latency metrics, and the admin actions
 (validate keys, reset keys, reload config). Model aliases from your config are
-listed in the footer.
+listed in the footer. When `workspace_usage.session_cookie` is configured, a workspace usage section shows per-workspace per-model cost and quota breakdowns, and the dashboard can auto-fill the proxy key on first load when `server.dashboard_auto_key` is `auto` (loopback-only) or `true` (always).
 
 The dashboard shell loads without authentication. Data calls use your
 `PROXY_API_KEY`, entered once in the dashboard's Settings panel and stored in
@@ -156,6 +157,7 @@ Use `Authorization: Bearer $PROXY_API_KEY`:
 
 - `GET /usage` or `GET /v1/usage` (aggregated quota, supports `?refresh=true`)
 - `GET /admin/status` (in-memory key states and cooldown status)
+- `GET /admin/workspace-usage` (per-workspace per-model cost/quota breakdown)
 - `POST /admin/validate-keys` (active probe of all keys against `/models`)
 - `POST /admin/reset-key` (un-exhaust a specific key by index)
 - `POST /admin/reset-all-keys` (un-exhaust all keys immediately)

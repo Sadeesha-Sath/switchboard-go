@@ -139,6 +139,59 @@ Switchboard Go supports multi-destination alerts on key rotation and key exhaust
 - **`round_robin`**: Rotates sequentially through eligible, non-saturated keys on every request.
 - **`fill_first`**: Fills Key 0 up to the proactive switch threshold (default 95%) or exhaustion, then moves to Key 1, Key 2, etc.
 
+## Workspace usage scraping
+
+Per-model cost and quota breakdowns are scraped from the OpenCode console and
+shown in the dashboard's workspace usage section. The feature is off when no
+session cookie is configured.
+
+### YAML
+
+```yaml
+workspace_usage:
+  # Session cookie from opencode.ai (DevTools → Application → Cookies → "auth")
+  session_cookie: ""
+  # Optional: restrict to specific workspace IDs (default: auto-discover all)
+  workspace_ids:
+    - "wrk_01M1CDMTPY3W0AGGKXZA0147N5"
+  # Polling interval (default: 60s, 0 disables polling)
+  interval: "60s"
+
+server:
+  # Dashboard first-load proxy key: "auto" (default) embeds the key only when
+  # listen_addr is loopback; "true" always; "false" never.
+  dashboard_auto_key: "auto"
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `workspace_usage.session_cookie` | `""` (disabled) | `auth` cookie value from `https://opencode.ai`. When empty, scraping is disabled and `GET /admin/workspace-usage` returns `{"enabled": false}`. |
+| `workspace_usage.workspace_ids` | auto-discover | Restrict scraping to specific workspace IDs. When empty, all workspaces visible to the cookie are scraped. |
+| `workspace_usage.interval` | `60s` | Polling interval for console scraping. `0` disables background polling. Must be `>= 0`. |
+| `server.dashboard_auto_key` | `"auto"` | Controls whether the dashboard HTML embeds the proxy key for first-load convenience. `auto` embeds only when `listen_addr` is loopback (`127.0.0.1`, `::1`, `localhost`); `true` always embeds; `false` never embeds. The Settings panel override in localStorage still takes precedence. |
+
+### Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `OPENCODE_SESSION_COOKIE` | Overrides `workspace_usage.session_cookie`. |
+| `OPENCODE_WORKSPACE_IDS` | Overrides `workspace_usage.workspace_ids` (comma-separated, e.g. `wrk_a,wrk_b`). |
+| `WORKSPACE_USAGE_INTERVAL` | Overrides `workspace_usage.interval` (Go duration, e.g. `60s`). |
+| `DASHBOARD_AUTO_KEY` | Overrides `server.dashboard_auto_key` (`auto` \| `true` \| `false`). |
+
+### Obtaining the session cookie
+
+1. Log in at `https://opencode.ai`.
+2. Open DevTools → Application → Cookies → `https://opencode.ai`.
+3. Copy the value of the `auth` cookie.
+4. Paste it into `workspace_usage.session_cookie` or `OPENCODE_SESSION_COOKIE`.
+
+The cookie is valid for up to 365 days. Treat it as a secret — restrict config file permissions to `0600` and prefer environment injection in shared environments.
+
+### Failure behavior
+
+Workspace usage scraping is best-effort and never affects proxying. If the cookie is missing, expired, or the console is unreachable, the poller records the error and `GET /admin/workspace-usage` returns the error in its snapshot; the dashboard shows an error banner in the workspace usage section. Proxying, quota polling, and all other endpoints continue to work normally.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
