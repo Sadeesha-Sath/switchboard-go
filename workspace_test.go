@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -179,5 +180,41 @@ func TestWorkspaceClientDiscoveryFailure(t *testing.T) {
 	snap := c.Snapshot()
 	if !snap.Enabled || snap.Error == "" {
 		t.Fatalf("snapshot should stay enabled with error set: %+v", snap)
+	}
+}
+
+func TestAdminWorkspaceUsageEndpoint(t *testing.T) {
+	cfg := Config{
+		ProxyAPIKey:         "test-proxy-key",
+		UpstreamAPIKeys:     []string{testKey0},
+		UpstreamBaseURL:     "http://127.0.0.1:1",
+		MaxRequestBodyBytes: 1024,
+		DisableUsagePolling: true,
+	}
+	app := newApp(cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/workspace-usage", nil)
+	app.serve(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated = %d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/admin/workspace-usage", nil)
+	req.Header.Set("Authorization", "Bearer test-proxy-key")
+	app.serve(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated = %d, want 200", rec.Code)
+	}
+	var snap WorkspaceUsageSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.Enabled {
+		t.Fatalf("feature should be disabled without a cookie: %+v", snap)
+	}
+	if snap.Workspaces == nil {
+		t.Fatalf("workspaces should be an empty array, not null")
 	}
 }

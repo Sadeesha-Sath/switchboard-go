@@ -360,6 +360,25 @@ func (w *WorkspaceUsageClient) setSnapshotError(msg string) {
 	w.mu.Unlock()
 }
 
+func (a *App) startWorkspaceUsagePoller(ctx context.Context) {
+	if a.workspace == nil || a.config.WorkspaceUsage.Interval <= 0 {
+		return
+	}
+	go a.workspace.Refresh(ctx)
+	ticker := time.NewTicker(a.config.WorkspaceUsage.Interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.workspace.Refresh(ctx)
+			}
+		}
+	}()
+}
+
 // Snapshot returns the latest scrape result. Safe on a nil receiver.
 func (w *WorkspaceUsageClient) Snapshot() WorkspaceUsageSnapshot {
 	if w == nil {

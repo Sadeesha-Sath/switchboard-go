@@ -2125,11 +2125,12 @@ func (w *statusCaptureWriter) Flush() {
 }
 
 type App struct {
-	config  Config
-	keys    *KeyManager
-	client  *http.Client
-	sender  *AlertNotifier
-	metrics *MetricsRegistry
+	config    Config
+	keys      *KeyManager
+	client    *http.Client
+	sender    *AlertNotifier
+	metrics   *MetricsRegistry
+	workspace *WorkspaceUsageClient
 }
 
 func newApp(cfg Config) *App {
@@ -2153,7 +2154,7 @@ func newApp(cfg Config) *App {
 			cfg.ProactiveSwitchThreshold,
 		)
 	}
-	return &App{
+	app := &App{
 		config: cfg,
 		keys:   km,
 		client: &http.Client{
@@ -2171,6 +2172,12 @@ func newApp(cfg Config) *App {
 		sender:  NewAlertNotifier(cfg.SMTP, cfg.Alerts),
 		metrics: NewMetricsRegistry(),
 	}
+	app.workspace = NewWorkspaceUsageClient(
+		"",
+		cfg.WorkspaceUsage.SessionCookie,
+		cfg.WorkspaceUsage.WorkspaceIDs,
+	)
+	return app
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -2262,6 +2269,9 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/admin/status" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(a.keys.Status())
+	case r.URL.Path == "/admin/workspace-usage" && r.Method == http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(a.workspace.Snapshot())
 	default:
 		http.NotFound(w, r)
 	}
@@ -2283,6 +2293,11 @@ func (a *App) ReloadConfig() error {
 		newCfg.ProactiveSwitchThreshold,
 	)
 	a.sender = NewAlertNotifier(newCfg.SMTP, newCfg.Alerts)
+	a.workspace = NewWorkspaceUsageClient(
+		"",
+		newCfg.WorkspaceUsage.SessionCookie,
+		newCfg.WorkspaceUsage.WorkspaceIDs,
+	)
 	log.Printf("config reloaded: %s", safeConfigSummary(newCfg))
 	return nil
 }
@@ -3070,6 +3085,7 @@ func main() {
 	defer stop()
 
 	a.startUsagePoller(ctx)
+	a.startWorkspaceUsagePoller(ctx)
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
