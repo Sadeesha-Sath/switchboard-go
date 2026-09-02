@@ -77,15 +77,33 @@ public final class APIClient: APIServing {
         request.httpMethod = "POST"
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        _ = try await run(request)
+        let (_, response) = try await run(request)
+        try validate(response)
     }
 
     private func request(path: String) -> URLRequest {
-        var request = URLRequest(url: URL(string: baseURL.absoluteString + path)!)
+        var base = baseURL.absoluteString
+        while base.hasSuffix("/") { base.removeLast() }
+        var request = URLRequest(url: URL(string: base + path)!)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 10
         return request
+    }
+
+    private func validate(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport("non-HTTP response")
+        }
+        switch http.statusCode {
+        case 401:
+            throw APIError.unauthorized
+        case 200..<300:
+            return
+        default:
+            throw APIError.http(http.statusCode)
+        }
     }
 
     private func run(_ request: URLRequest) async throws -> (Data, URLResponse) {

@@ -132,6 +132,18 @@ final class APIClientTests: XCTestCase {
         try await makeClient().reloadConfig()
     }
 
+    func testReloadConfigUnauthorizedThrowsTypedError() async {
+        MockURLProtocol.requestHandler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        do {
+            try await makeClient().reloadConfig()
+            XCTFail("expected unauthorized")
+        } catch {
+            XCTAssertEqual(error as? APIError, .unauthorized)
+        }
+    }
+
     override func tearDown() {
         MockURLProtocol.requestHandler = nil
         MockURLProtocol.lastBody = nil
