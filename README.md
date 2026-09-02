@@ -29,6 +29,7 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - **Dynamic Configuration Reloading (`/admin/reload`, `SIGHUP`)**: Hot-reload keys, priorities, weights, aliases, and webhooks in-memory without downtime
 - **Aggregated Quota Endpoint (`/usage`, `/v1/usage`)**: Compatible with OpenCode widget tools (Waybar, Polybar, VS Code) while exposing full pool metrics
 - **Built-in Web Dashboard (`/dashboard`)**: Local UI for per-key quota, pool usage, live metrics, and admin actions (validate, reset, reload)
+- **macOS Menu Bar App (`menu-bar/`)**: Native live status, notifications on key exhaustion, and admin actions; build with `swift build -c release` (see [docs/menubar.md](docs/menubar.md))
 - **Multi-Strategy Routing**: `session_sticky` (default) preserves upstream KV prompt caching across agent turns; `balanced`, `round_robin`, and `fill_first` also available
 - **Proactive Quota Switching**: Automatically switches away from subscriptions at $\ge 95\%$ capacity before hitting 429 errors
 - **Dynamic Reset Cooldown & Recovery**: Keys cool down until their exact upstream `resetsAt` and automatically recover when quota resets
@@ -137,6 +138,17 @@ The dashboard shell loads without authentication. Data calls use your
 `PROXY_API_KEY`, entered once in the dashboard's Settings panel and stored in
 the browser's localStorage; every request is sent as
 `Authorization: Bearer $PROXY_API_KEY`.
+
+## macOS menu bar app
+
+A native menu bar companion lives in `menu-bar/` (SwiftPM, macOS 13+):
+
+    cd menu-bar && swift build -c release
+    .build/release/SwitchboardMenu &
+
+It auto-discovers the proxy via the same config precedence as the server and
+shows live quota state, notifications, and admin actions. See
+[docs/menubar.md](docs/menubar.md).
 
 ## Usage and admin endpoints
 
