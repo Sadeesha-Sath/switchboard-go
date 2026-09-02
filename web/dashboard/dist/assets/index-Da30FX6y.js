@@ -102,7 +102,7 @@
     <div class="card">
       <div class="card-value">${e.total_keys}</div>
       <div class="card-label">Keys</div>
-      <div class="card-sub"><span class="chip ok">${e.available_keys} avail</span> <span class="chip ${e.exhausted_keys>0?"bad":"muted-chip"}">${e.exhausted_keys} exhausted</span></div>
+      <div class="card-sub"><span class="chip ok">${e.available_keys} available</span> <span class="chip ${e.exhausted_keys>0?"bad":"muted-chip"}">${e.exhausted_keys} exhausted</span></div>
     </div>
     <div class="card">
       <div class="card-value">${e.active_sessions}</div>
