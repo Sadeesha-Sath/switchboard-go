@@ -8,7 +8,7 @@ export function renderSummary(usage: AggregatedUsageResponse): string {
     <div class="card">
       <div class="card-value">${s.total_keys}</div>
       <div class="card-label">Keys</div>
-      <div class="card-sub"><span class="chip ok">${s.available_keys} avail</span> <span class="chip ${s.exhausted_keys > 0 ? 'bad' : 'muted-chip'}">${s.exhausted_keys} exhausted</span></div>
+      <div class="card-sub"><span class="chip ok">${s.available_keys} available</span> <span class="chip ${s.exhausted_keys > 0 ? 'bad' : 'muted-chip'}">${s.exhausted_keys} exhausted</span></div>
     </div>
     <div class="card">
       <div class="card-value">${s.active_sessions}</div>
