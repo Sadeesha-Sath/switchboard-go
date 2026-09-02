@@ -3,6 +3,7 @@ import type {
   MetricsSnapshot,
   StatusResponse,
   ValidateKeysResponse,
+  WorkspaceUsageSnapshot,
 } from './types';
 
 export class ApiError extends Error {
@@ -79,4 +80,11 @@ export async function resetAllKeys(base: string, apiKey: string): Promise<Status
 
 export async function reloadConfig(base: string, apiKey: string): Promise<void> {
   await postJSON(base, '/admin/reload', apiKey);
+}
+
+export async function fetchWorkspaceUsage(
+  base: string,
+  apiKey: string,
+): Promise<WorkspaceUsageSnapshot> {
+  return getJSON<WorkspaceUsageSnapshot>(base, '/admin/workspace-usage', apiKey);
 }

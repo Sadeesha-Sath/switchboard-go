@@ -127,3 +127,36 @@ export interface MetricsSnapshot {
   active_sessions: number;
   model_aliases?: Record<string, string>;
 }
+
+export interface WorkspaceModelRow {
+  model: string;
+  name: string;
+  cost: number;
+  quota_cost: number;
+  multiplier?: number;
+  contribution_percent: number;
+  estimated: boolean;
+}
+
+export interface WorkspaceWindowSnapshot {
+  status: string;
+  usage_usd: number;
+  limit_usd: number;
+  usage_percent: number;
+  reset_in_sec: number;
+  rows: WorkspaceModelRow[];
+}
+
+export interface WorkspaceStatus {
+  id: string;
+  name: string;
+  windows: Record<string, WorkspaceWindowSnapshot>;
+  error?: string;
+}
+
+export interface WorkspaceUsageSnapshot {
+  enabled: boolean;
+  updated_at?: string;
+  error?: string;
+  workspaces: WorkspaceStatus[];
+}

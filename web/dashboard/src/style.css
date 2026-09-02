@@ -411,6 +411,59 @@ th {
   opacity: 1;
 }
 
+#workspace-usage {
+  background: var(--panel, #14161a);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.ws-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.ws-tab {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: transparent;
+  color: inherit;
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.ws-tab.active {
+  background: rgba(99, 179, 237, 0.18);
+  border-color: rgba(99, 179, 237, 0.6);
+}
+
+.ws-window {
+  margin-bottom: 16px;
+}
+
+.ws-window-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.ws-window table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+}
+
+.ws-window th,
+.ws-window td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
 @media (max-width: 700px) {
   .topbar {
     flex-direction: column;

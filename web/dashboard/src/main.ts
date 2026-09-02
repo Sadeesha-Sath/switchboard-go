@@ -3,16 +3,18 @@ import {
   ApiError,
   fetchMetrics,
   fetchUsage,
+  fetchWorkspaceUsage,
   reloadConfig,
   resetAllKeys,
   resetKey,
   validateKeys,
 } from './api';
-import type { AggregatedUsageResponse, MetricsSnapshot } from './types';
+import type { AggregatedUsageResponse, MetricsSnapshot, WorkspaceUsageSnapshot } from './types';
 import { renderPool } from './components/PoolUsage';
 import { renderKeys } from './components/KeysTable';
 import { renderMetrics } from './components/MetricsPanel';
 import { renderSummary } from './components/SummaryCards';
+import { renderWorkspaceUsage } from './components/WorkspaceUsage';
 import { esc, fmtCountdown } from './utils';
 
 declare global {
@@ -47,6 +49,8 @@ let settings = loadSettings();
 let pollTimer: number | undefined;
 let lastUsage: AggregatedUsageResponse | null = null;
 let lastSnap: MetricsSnapshot | null = null;
+let lastWorkspace: WorkspaceUsageSnapshot | null = null;
+let selectedWorkspaceID: string | null = null;
 
 const $ = <T extends HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -100,12 +104,14 @@ async function poll(forceRefresh: boolean, retried = false): Promise<void> {
     return;
   }
   try {
-    const [usage, snap] = await Promise.all([
+    const [usage, snap, ws] = await Promise.all([
       fetchUsage(settings.baseUrl, settings.apiKey, forceRefresh),
       fetchMetrics(settings.baseUrl),
+      fetchWorkspaceUsage(settings.baseUrl, settings.apiKey),
     ]);
     lastUsage = usage;
     lastSnap = snap;
+    lastWorkspace = ws;
     banner(null);
     render();
   } catch (err) {
@@ -136,6 +142,15 @@ function render(): void {
   $('#pool').innerHTML = renderPool(lastUsage);
   $('#keys').innerHTML = renderKeys(lastUsage);
   $('#metrics').innerHTML = renderMetrics(lastSnap, lastUsage);
+
+  const wsSection = $('#workspace-usage');
+  if (lastWorkspace && lastWorkspace.enabled && lastWorkspace.workspaces.length > 0) {
+    wsSection.hidden = false;
+    wsSection.innerHTML = renderWorkspaceUsage(lastWorkspace, selectedWorkspaceID);
+  } else {
+    wsSection.hidden = true;
+    wsSection.innerHTML = '';
+  }
 
   const aliases = Object.entries(lastSnap.model_aliases ?? {});
   const chips = aliases
@@ -215,6 +230,17 @@ function bindEvents(): void {
     } else {
       startPolling();
       void poll(false);
+    }
+  });
+
+  $('#workspace-usage').addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-ws-tab]');
+    if (!btn) {
+      return;
+    }
+    selectedWorkspaceID = btn.dataset.wsTab ?? null;
+    if (lastWorkspace) {
+      $('#workspace-usage').innerHTML = renderWorkspaceUsage(lastWorkspace, selectedWorkspaceID);
     }
   });
 }
