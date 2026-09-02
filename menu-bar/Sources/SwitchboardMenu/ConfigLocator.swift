@@ -51,7 +51,7 @@ public enum ConfigLocator {
         if addr.hasPrefix(":") {
             addr = "127.0.0.1" + addr
         } else if addr.hasPrefix("0.0.0.0:") {
-            addr = addr.replacingOccurrences(of: "0.0.0.0:", with: "127.0.0.1:")
+            addr = "127.0.0.1" + addr.dropFirst("0.0.0.0".count)
         }
         return URL(string: "http://" + addr)!
     }

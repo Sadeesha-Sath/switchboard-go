@@ -30,6 +30,7 @@ public final class StatusModel: ObservableObject {
     @Published public var pollInterval: TimeInterval {
         didSet {
             guard pollInterval != oldValue else { return }
+            guard timer != nil else { return }
             restartTimer()
         }
     }
@@ -55,7 +56,7 @@ public final class StatusModel: ObservableObject {
             }
         } catch {
             lastError = error.localizedDescription
-            isConfigured = !(error is APIError && (error as? APIError) == .unauthorized)
+            isConfigured = !((error as? APIError) == .unauthorized)
             needsAttention = true
         }
     }
@@ -63,7 +64,7 @@ public final class StatusModel: ObservableObject {
     private func restartTimer() {
         stopPolling()
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 await self?.refresh()
             }
         }

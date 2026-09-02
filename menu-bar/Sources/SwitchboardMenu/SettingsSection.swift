@@ -51,12 +51,15 @@ struct SettingsSection: View {
 
             HStack {
                 Button("Save") {
-                    var trimmed = baseURL
+                    var trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     while trimmed.hasSuffix("/") { trimmed.removeLast() }
                     let url = URL(string: trimmed) ?? URL(string: "http://127.0.0.1:8495")!
-                    model.updateConnection(baseURL: url, apiKey: apiKey)
-                    if !apiKey.isEmpty {
-                        KeychainStore.save(apiKey)
+                    let effectiveKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !effectiveKey.isEmpty {
+                        model.updateConnection(baseURL: url, apiKey: effectiveKey)
+                        KeychainStore.save(effectiveKey)
+                    } else {
+                        (model.api as? APIClient)?.baseURL = url
                     }
                     savedFlash = true
                     Task {
@@ -90,7 +93,7 @@ struct SettingsSection: View {
             if let client = model.api as? APIClient {
                 baseURL = client.baseURL.absoluteString
             }
-            apiKey = KeychainStore.load() ?? ""
+            apiKey = KeychainStore.load() ?? (model.api as? APIClient)?.apiKey ?? ""
         }
     }
 }

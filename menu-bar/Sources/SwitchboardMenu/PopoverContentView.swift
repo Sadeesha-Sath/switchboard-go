@@ -205,8 +205,8 @@ struct PopoverContentView: View {
 
             HStack {
                 Button("Open Dashboard") {
-                    if let base = (model.api as? APIClient)?.baseURL,
-                       let url = URL(string: base.absoluteString + "/dashboard/") {
+                    if let base = (model.api as? APIClient)?.baseURL {
+                        let url = base.appendingPathComponent("dashboard", isDirectory: true)
                         NSWorkspace.shared.open(url)
                     }
                 }
