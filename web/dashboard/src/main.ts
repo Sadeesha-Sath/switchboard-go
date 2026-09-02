@@ -15,6 +15,14 @@ import { renderMetrics } from './components/MetricsPanel';
 import { renderSummary } from './components/SummaryCards';
 import { esc, fmtCountdown } from './utils';
 
+declare global {
+  interface Window {
+    __SWB_CONFIG__?: { apiKey?: string };
+  }
+}
+
+const embeddedKey: string = window.__SWB_CONFIG__?.apiKey ?? '';
+
 interface Settings {
   baseUrl: string;
   apiKey: string;
@@ -86,7 +94,7 @@ function startPolling(): void {
   }
 }
 
-async function poll(forceRefresh: boolean): Promise<void> {
+async function poll(forceRefresh: boolean, retried = false): Promise<void> {
   if (!settings.apiKey) {
     banner('Set your proxy API key in Settings to load usage data.');
     return;
@@ -102,6 +110,14 @@ async function poll(forceRefresh: boolean): Promise<void> {
     render();
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
+      const usedOverride =
+        settings.apiKey !== '' && settings.apiKey !== embeddedKey;
+      if (usedOverride && embeddedKey && !retried) {
+        localStorage.removeItem(LS_KEY);
+        settings.apiKey = embeddedKey;
+        $<HTMLInputElement>('#proxy-key').value = embeddedKey;
+        return poll(forceRefresh, true);
+      }
       banner('Invalid proxy API key — update it in Settings.');
       $('#settings').hidden = false;
     } else if (err instanceof ApiError) {
@@ -169,9 +185,9 @@ function bindEvents(): void {
 
   $('#clear-key').addEventListener('click', () => {
     localStorage.removeItem(LS_KEY);
-    settings.apiKey = '';
-    $<HTMLInputElement>('#proxy-key').value = '';
-    banner('Proxy key cleared.');
+    settings.apiKey = embeddedKey;
+    $<HTMLInputElement>('#proxy-key').value = embeddedKey;
+    banner('Proxy key override cleared.');
   });
 
   $('#interval').addEventListener('change', () => {
@@ -259,6 +275,9 @@ function init(): void {
   $<HTMLInputElement>('#proxy-key').value = settings.apiKey;
   bindEvents();
   window.setInterval(tickCountdowns, 1000);
+  if (!settings.apiKey && embeddedKey) {
+    settings.apiKey = embeddedKey;
+  }
   if (settings.apiKey) {
     void poll(false);
   } else {

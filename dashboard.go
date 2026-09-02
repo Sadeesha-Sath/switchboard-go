@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,6 +26,46 @@ func maskKeyHint(key string) string {
 		return key[:7] + "…" + key[len(key)-4:]
 	}
 	return "…"
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func (a *App) dashboardAutoKeyEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(a.config.DashboardAutoKey)) {
+	case "true":
+		return true
+	case "false":
+		return false
+	default:
+		return isLoopbackListenAddr(a.config.ListenAddr)
+	}
+}
+
+// serveDashboardIndex serves the embedded index.html, optionally injecting the
+// proxy API key for first-load convenience (loopback or explicitly enabled).
+func (a *App) serveDashboardIndex(w http.ResponseWriter, sub fs.FS) {
+	b, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
+		return
+	}
+	html := string(b)
+	if a.dashboardAutoKeyEnabled() {
+		cfgJSON, _ := json.Marshal(map[string]string{"apiKey": a.config.ProxyAPIKey})
+		html = strings.Replace(html, "<body>", "<body><script>window.__SWB_CONFIG__="+string(cfgJSON)+";</script>", 1)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(html))
 }
 
 func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +94,10 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/dashboard")
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		a.serveDashboardIndex(w, sub)
+		return
+	}
 	http.FileServer(http.FS(sub)).ServeHTTP(w, r)
 }
 

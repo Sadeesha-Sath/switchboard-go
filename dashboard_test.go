@@ -214,3 +214,52 @@ func TestDashboardMetricsJSON(t *testing.T) {
 		t.Fatalf("snapshot leaked upstream keys")
 	}
 }
+
+func TestDashboardAutoKeyEmbedding(t *testing.T) {
+	cases := []struct {
+		name    string
+		listen  string
+		setting string
+		wantKey bool
+	}{
+		{"loopback auto", "127.0.0.1:8080", "auto", true},
+		{"all-interfaces auto", ":8080", "auto", false},
+		{"forced on", ":8080", "true", true},
+		{"forced off loopback", "127.0.0.1:8080", "false", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newDashboardTestApp(t)
+			app.config.ListenAddr = tc.listen
+			app.config.DashboardAutoKey = tc.setting
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/dashboard/", nil)
+			app.handleDashboard(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d", rec.Code)
+			}
+			body := rec.Body.String()
+			has := strings.Contains(body, "__SWB_CONFIG__") && strings.Contains(body, "test-proxy-key")
+			if has != tc.wantKey {
+				t.Fatalf("key embedded = %v, want %v\nbody: %s", has, tc.wantKey, body)
+			}
+		})
+	}
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8080": true,
+		"localhost:9000": true,
+		"[::1]:8080":     true,
+		":8080":          false,
+		"0.0.0.0:8080":   false,
+		"192.168.1.5:80": false,
+		"":               false,
+	}
+	for addr, want := range cases {
+		if got := isLoopbackListenAddr(addr); got != want {
+			t.Fatalf("isLoopbackListenAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
