@@ -1,9 +1,10 @@
 import Foundation
 import Security
 
-/// Stores the manually-entered proxy key. The auto-discovered key from
-/// config.yaml is NOT persisted here — it is re-read each launch so config
-/// changes are picked up (Keychain wins over config when both exist).
+/// Stores the manually-entered proxy key in the login keychain. The
+/// auto-discovered key from config.yaml is NOT persisted here — it is
+/// re-read each launch so config changes are picked up (Keychain wins over
+/// config when both exist).
 public enum KeychainStore {
     private static let service = "switchboard-go-menu-bar"
     private static let account = "proxy-api-key"
@@ -13,7 +14,6 @@ public enum KeychainStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecUseDataProtectionKeychain as String: true,
         ]
     }
 
