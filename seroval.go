@@ -33,7 +33,7 @@ func parseSerovalStream(body string) (any, error) {
 		}
 		start := pos + 3 + semi + 1
 		end := start + int(n)
-		if end > len(body) {
+		if n < 0 || end > len(body) {
 			return nil, fmt.Errorf("seroval: frame length %d exceeds body size", n)
 		}
 		payload.WriteString(body[start:end])

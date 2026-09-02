@@ -101,6 +101,7 @@ func TestParseSerovalStreamTruncatedAndBadFrame(t *testing.T) {
 		{name: "truncated after {", body: ";0x00000007;$R[0]={"},
 		{name: "truncated after trailing comma", body: frame("$R[0]={a:1,")},
 		{name: "bad frame header", body: "not-a-frame"},
+		{name: "negative frame length", body: ";0x-5;hello"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

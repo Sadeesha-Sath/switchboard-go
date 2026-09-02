@@ -144,7 +144,7 @@ function render(): void {
   $('#metrics').innerHTML = renderMetrics(lastSnap, lastUsage);
 
   const wsSection = $('#workspace-usage');
-  if (lastWorkspace && lastWorkspace.enabled && lastWorkspace.workspaces.length > 0) {
+  if (lastWorkspace && lastWorkspace.enabled && (lastWorkspace.workspaces.length > 0 || !!lastWorkspace.error)) {
     wsSection.hidden = false;
     wsSection.innerHTML = renderWorkspaceUsage(lastWorkspace, selectedWorkspaceID);
   } else {
