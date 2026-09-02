@@ -1,5 +1,5 @@
 import type { WorkspaceStatus, WorkspaceUsageSnapshot, WorkspaceWindowSnapshot } from '../types';
-import { esc } from '../utils';
+import { esc, usageClass } from '../utils';
 
 export const WINDOW_LABELS: Record<string, string> = {
   rolling: '5-hour',
@@ -18,6 +18,7 @@ function fmtUSD(amount: number): string {
 
 function renderWindow(win: WorkspaceWindowSnapshot, label: string): string {
   const pct = Math.min(100, Math.max(0, win.usage_percent));
+  const cls = usageClass(pct, 95);
   const resetsAt = new Date(Date.now() + win.reset_in_sec * 1000).toISOString();
   const rows = win.rows
     .map(
@@ -41,9 +42,7 @@ function renderWindow(win: WorkspaceWindowSnapshot, label: string): string {
         <span>${esc(label)}</span>
         <span class="mono">${win.usage_percent.toFixed(1)}% · ${fmtUSD(win.usage_usd)} / ${fmtUSD(win.limit_usd)}</span>
       </div>
-      <div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
-        <div class="progress-bar" style="width:${pct}%"></div>
-      </div>
+      <div class="bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
       <div class="muted small">Resets in <span data-countdown="${esc(resetsAt)}"></span></div>
       ${table}
     </div>`;
