@@ -657,6 +657,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("WORKSPACE_USAGE_INTERVAL")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
 			cfg.WorkspaceUsage.Interval = d
+		} else {
+			cfg.WorkspaceUsage.Interval = -1
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("DASHBOARD_AUTO_KEY")); v != "" {

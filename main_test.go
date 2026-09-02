@@ -1696,13 +1696,18 @@ func TestWorkspaceUsageConfigDefaultsAndValidation(t *testing.T) {
 	if base.WorkspaceUsage.Interval != 60*time.Second {
 		t.Fatalf("merged interval = %v, want default 60s", base.WorkspaceUsage.Interval)
 	}
-	t.Setenv("WORKSPACE_USAGE_INTERVAL", "bogus")
-	applyEnvOverrides(&base)
-	if base.WorkspaceUsage.Interval != 60*time.Second {
-		t.Fatalf("bogus env must not clobber interval, got %v", base.WorkspaceUsage.Interval)
-	}
 	if err := validateConfig(base); err != nil {
 		t.Fatalf("validateConfig: %v", err)
+	}
+
+	bogus := defaultConfig()
+	t.Setenv("WORKSPACE_USAGE_INTERVAL", "bogus")
+	applyEnvOverrides(&bogus)
+	if bogus.WorkspaceUsage.Interval != -1 {
+		t.Fatalf("bogus interval should map to -1 sentinel, got %v", bogus.WorkspaceUsage.Interval)
+	}
+	if err := validateConfig(bogus); err == nil {
+		t.Fatal("expected validation error for bogus interval env")
 	}
 
 	bad := base
