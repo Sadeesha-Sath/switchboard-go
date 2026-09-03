@@ -9,12 +9,19 @@ export function esc(s: string): string {
 
 export function fmtPct(v: number | undefined): string {
   if (v === undefined || Number.isNaN(v)) {
-    return '—';
+    return '0.0%';
   }
-  return `${Math.round(v * 10) / 10}%`;
+  return `${v.toFixed(1)}%`;
 }
 
-export function usageClass(percent: number | undefined, threshold: number): string {
+export function fmtUSD(amount: number | undefined): string {
+  if (amount === undefined || Number.isNaN(amount)) {
+    return '$0.00';
+  }
+  return '$' + amount.toFixed(2);
+}
+
+export function usageClass(percent: number | undefined, threshold = 95): string {
   if (percent === undefined || Number.isNaN(percent)) {
     return 'ok';
   }
@@ -57,7 +64,7 @@ export function fmtCountdown(iso: string | undefined, now: number = Date.now()):
   if (diff <= 0) {
     return 'reset due';
   }
-  return `in ${fmtDuration(diff)}`;
+  return fmtDuration(diff);
 }
 
 export function fmtTimeAgo(iso: string | undefined, now: number = Date.now()): string {
@@ -93,5 +100,6 @@ export function fmtAvgMs(sumSeconds: number, count: number): string {
   if (count <= 0) {
     return '—';
   }
-  return `${Math.round((sumSeconds / count) * 1000)}ms`;
+  const ms = Math.round((sumSeconds / count) * 1000);
+  return `${ms.toLocaleString('en-US')} ms`;
 }
