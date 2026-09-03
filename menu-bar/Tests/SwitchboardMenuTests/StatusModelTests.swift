@@ -138,4 +138,24 @@ final class StatusModelTests: XCTestCase {
         XCTAssertEqual(client.baseURL.absoluteString, "http://127.0.0.1:9000")
         XCTAssertEqual(client.apiKey, "b")
     }
+
+    func testRefreshUpdatesIsRefreshing() async {
+        let api = MockAPI()
+        api.usage = usage(states: ["available"])
+        let model = StatusModel(api: api, notifier: MockNotifier(), interval: 999)
+        XCTAssertFalse(model.isRefreshing)
+        await model.refresh()
+        XCTAssertFalse(model.isRefreshing)
+    }
+
+    func testPerformValidateAndReloadCallsAPI() async {
+        let api = MockAPI()
+        api.usage = usage(states: ["available"])
+        let model = StatusModel(api: api, notifier: MockNotifier(), interval: 999)
+        await model.perform(.validateKeys)
+        XCTAssertEqual(api.validateCalls, 1)
+
+        await model.perform(.reloadConfig)
+        XCTAssertEqual(api.reloadCalls, 1)
+    }
 }

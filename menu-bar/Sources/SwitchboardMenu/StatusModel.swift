@@ -24,6 +24,7 @@ public final class StatusModel: ObservableObject {
     @Published public private(set) var lastError: String?
     @Published public private(set) var needsAttention = false
     @Published public var isConfigured = true
+    @Published public private(set) var isRefreshing = false
 
     public let api: APIServing
     private let notifier: Notifying
@@ -43,6 +44,8 @@ public final class StatusModel: ObservableObject {
     }
 
     public func refresh(force: Bool = false) async {
+        isRefreshing = true
+        defer { isRefreshing = false }
         do {
             let fresh = try await api.fetchUsage(forceRefresh: force)
             let transitions = Self.diffTransitions(old: usage, new: fresh)
