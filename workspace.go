@@ -187,7 +187,7 @@ func (w *WorkspaceUsageClient) listWorkspaces(ctx context.Context, hashes map[st
 
 var (
 	entryScriptRe = regexp.MustCompile(`<script[^>]+src="(/_build/assets/entry-client-[^"]+\.js)"`)
-	chunkImportRe = regexp.MustCompile(`import\("\./([^"]+\.js)"\)`)
+	chunkImportRe = regexp.MustCompile(`"\./([^"]+\.js)"`)
 	serverFnRefRe = regexp.MustCompile(`(getWorkspaces|queryLiteSubscription|queryLiteUsageDetails)_query\s*=\s*createServerReference\("([0-9a-f]{64})"\)`)
 )
 

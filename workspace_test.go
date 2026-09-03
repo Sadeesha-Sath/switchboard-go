@@ -218,3 +218,31 @@ func TestAdminWorkspaceUsageEndpoint(t *testing.T) {
 		t.Fatalf("workspaces should be an empty array, not null")
 	}
 }
+
+func TestWorkspaceClientDiscoveryNewBundleFormat(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><script src="/_build/assets/entry-client-NEW.js"></script></html>`)
+	})
+	mux.HandleFunc("/_build/assets/entry-client-NEW.js", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `"build": () => __vitePreload(() => import(
+  /* @vite-ignore */
+  "./go-PAGE.js"
+), true ? __vite__mapDeps([1,2]) : void 0)`)
+	})
+	mux.HandleFunc("/_build/assets/go-PAGE.js", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `const queryLiteSubscription_query = createServerReference("%s");const queryLiteUsageDetails_query = createServerReference("%s");const getWorkspaces_query = createServerReference("%s")`, fakeHashSubscription, fakeHashDetails, fakeHashWorkspaces)
+	})
+	mux.HandleFunc("/_server", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, frame(wrapRoot(`[{id:"wrk_test1",name:"Default",slug:null},{id:"wrk_test2",name:"Workspace 2",slug:null}]`)))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("discovery must survive vite-preload import formatting: %v", err)
+	}
+	if snap := c.Snapshot(); len(snap.Workspaces) != 2 {
+		t.Fatalf("workspaces = %d, want 2", len(snap.Workspaces))
+	}
+}
