@@ -1742,3 +1742,44 @@ func TestWorkspaceUsageEnvOverrides(t *testing.T) {
 		t.Fatalf("dashboard auto key = %q", base.DashboardAutoKey)
 	}
 }
+
+func TestAggregatedUsageWeeklyMonthlyEarliestReset(t *testing.T) {
+	km := NewKeyManagerWithConfig([]string{"key0", "key1"}, 5*time.Minute, "session_sticky", 2*time.Hour, 5*time.Minute, 95.0)
+	rolling0 := time.Date(2026, 9, 1, 14, 0, 0, 0, time.UTC)
+	rolling1 := time.Date(2026, 9, 1, 16, 0, 0, 0, time.UTC)
+	weekly0 := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	weekly1 := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	monthly0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	monthly1 := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	km.UpdateUsage(0, &KeyUsage{
+		Rolling: UsageWindow{Status: "ok", Percent: 40, ResetsAt: rolling0},
+		Weekly:  UsageWindow{Status: "ok", Percent: 20, ResetsAt: weekly0},
+		Monthly: UsageWindow{Status: "ok", Percent: 10, ResetsAt: monthly0},
+	}, "")
+	km.UpdateUsage(1, &KeyUsage{
+		Rolling: UsageWindow{Status: "ok", Percent: 60, ResetsAt: rolling1},
+		Weekly:  UsageWindow{Status: "ok", Percent: 30, ResetsAt: weekly1},
+		Monthly: UsageWindow{Status: "ok", Percent: 15, ResetsAt: monthly1},
+	}, "")
+
+	resp := km.GetAggregatedUsage()
+
+	if resp.Summary.PoolUsage == nil {
+		t.Fatalf("expected pool usage, got nil")
+	}
+	if resp.Summary.PoolUsage.Rolling.EarliestResetAt == nil || !resp.Summary.PoolUsage.Rolling.EarliestResetAt.Equal(rolling0) {
+		t.Fatalf("expected rolling earliest %v, got %v", rolling0, resp.Summary.PoolUsage.Rolling.EarliestResetAt)
+	}
+	if resp.Summary.PoolUsage.Weekly.EarliestResetAt == nil || !resp.Summary.PoolUsage.Weekly.EarliestResetAt.Equal(weekly0) {
+		t.Fatalf("expected weekly earliest %v, got %v", weekly0, resp.Summary.PoolUsage.Weekly.EarliestResetAt)
+	}
+	if resp.Summary.PoolUsage.Monthly.EarliestResetAt == nil || !resp.Summary.PoolUsage.Monthly.EarliestResetAt.Equal(monthly0) {
+		t.Fatalf("expected monthly earliest %v, got %v", monthly0, resp.Summary.PoolUsage.Monthly.EarliestResetAt)
+	}
+	if !resp.Weekly.ResetsAt.Equal(weekly0) {
+		t.Fatalf("expected top-level weekly reset %v, got %v", weekly0, resp.Weekly.ResetsAt)
+	}
+	if !resp.Monthly.ResetsAt.Equal(monthly0) {
+		t.Fatalf("expected top-level monthly reset %v, got %v", monthly0, resp.Monthly.ResetsAt)
+	}
+}

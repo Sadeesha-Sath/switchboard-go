@@ -1761,7 +1761,7 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 	minRolling, maxRolling := 100.0, 0.0
 	minWeekly, maxWeekly := 100.0, 0.0
 	minMonthly, maxMonthly := 100.0, 0.0
-	var earliestReset *time.Time
+	var earliestReset, earliestWeeklyReset, earliestMonthlyReset *time.Time
 
 	availableCount := 0
 	exhaustedCount := 0
@@ -1848,6 +1848,18 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 					earliestReset = &t
 				}
 			}
+			if !u.Weekly.ResetsAt.IsZero() {
+				if earliestWeeklyReset == nil || u.Weekly.ResetsAt.Before(*earliestWeeklyReset) {
+					t := u.Weekly.ResetsAt
+					earliestWeeklyReset = &t
+				}
+			}
+			if !u.Monthly.ResetsAt.IsZero() {
+				if earliestMonthlyReset == nil || u.Monthly.ResetsAt.Before(*earliestMonthlyReset) {
+					t := u.Monthly.ResetsAt
+					earliestMonthlyReset = &t
+				}
+			}
 		} else {
 			pku.Rolling = UsageWindow{Status: string(state)}
 			pku.Weekly = UsageWindow{Status: string(state)}
@@ -1886,12 +1898,14 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 			TotalRemainingPercent: poolCapacity - totalWeekly,
 			MinPercent:            minWeekly,
 			MaxPercent:            maxWeekly,
+			EarliestResetAt:       earliestWeeklyReset,
 		},
 		Monthly: SummaryWindow{
 			AveragePercent:        avgMonthly,
 			TotalRemainingPercent: poolCapacity - totalMonthly,
 			MinPercent:            minMonthly,
 			MaxPercent:            maxMonthly,
+			EarliestResetAt:       earliestMonthlyReset,
 		},
 	}
 
@@ -1909,10 +1923,22 @@ func (m *KeyManager) GetAggregatedUsage() AggregatedUsageResponse {
 		Weekly: UsageWindow{
 			Status:  "ok",
 			Percent: avgWeekly,
+			ResetsAt: func() time.Time {
+				if earliestWeeklyReset != nil {
+					return *earliestWeeklyReset
+				}
+				return time.Time{}
+			}(),
 		},
 		Monthly: UsageWindow{
 			Status:  "ok",
 			Percent: avgMonthly,
+			ResetsAt: func() time.Time {
+				if earliestMonthlyReset != nil {
+					return *earliestMonthlyReset
+				}
+				return time.Time{}
+			}(),
 		},
 		Summary: UsageSummary{
 			TotalKeys:                 n,
