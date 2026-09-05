@@ -8,4 +8,5 @@ node_modules/
 .openchamber/
 !web/dashboard/dist/
 menu-bar/.build/
+menu-bar/*.app
 .superpowers/

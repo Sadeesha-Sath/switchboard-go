@@ -11,6 +11,21 @@ opening a browser.
 
 Binary: `menu-bar/.build/release/SwitchboardMenu`. Requires macOS 13+.
 
+## Bundle as .app (recommended)
+
+The raw binary dies with the terminal and can't use Launch at login.
+Package it instead:
+
+    cd menu-bar
+    ./package-app.sh --install --open
+
+This creates `SwitchboardMenu.app` (`LSUIElement`, ad-hoc signed, Finder
+icon generated from `assets/favicon.svg` via `sips`/`iconutil`) and,
+with `--install`, copies it to `/Applications` — required for
+`SMAppService` Launch at login to work. Then enable
+`Settings → Launch at login` in the popover. Use `--icon PATH` for a
+custom icon source or `--no-icon` to skip icon generation.
+
 ## Run
 
     menu-bar/.build/release/SwitchboardMenu &

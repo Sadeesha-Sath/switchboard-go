@@ -1181,12 +1181,12 @@ func (m *KeyManager) bestKeyByQuotaLocked(exclude map[int]bool) (int, bool) {
 
 	best := pool[0]
 	for _, c := range pool[1:] {
-		if c.weekly < best.weekly {
+		if c.monthly < best.monthly {
 			best = c
-		} else if c.weekly == best.weekly {
-			if c.monthly < best.monthly {
+		} else if c.monthly == best.monthly {
+			if c.weekly < best.weekly {
 				best = c
-			} else if c.monthly == best.monthly {
+			} else if c.weekly == best.weekly {
 				if c.rolling < best.rolling {
 					best = c
 				} else if c.rolling == best.rolling {
