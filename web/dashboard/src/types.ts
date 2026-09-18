@@ -160,3 +160,45 @@ export interface WorkspaceUsageSnapshot {
   error?: string;
   workspaces: WorkspaceStatus[];
 }
+
+export interface ProxyConfigSettings {
+  routing_strategy: string;
+  session_ttl: string;
+  balanced_idle_timeout: string;
+  proactive_switch_threshold: number;
+  retry_exhausted_after: string;
+  usage_check_interval: string;
+  disable_usage_polling: boolean;
+  sanitize_developer_role: boolean;
+}
+
+export interface ProxyConfigKey {
+  id: number;
+  key_hint: string;
+  priority: number;
+  weight: number;
+}
+
+export interface ProxyConfigResponse {
+  config_source: string;
+  editable: boolean;
+  revision: string;
+  env_locked: string[];
+  settings: ProxyConfigSettings;
+  model_aliases: Record<string, string>;
+  keys: ProxyConfigKey[];
+}
+
+export interface ProxyConfigKeyPatch {
+  id?: number;
+  key?: string;
+  priority?: number;
+  weight?: number;
+}
+
+export interface ProxyConfigPatch {
+  if_revision: string;
+  settings?: Record<string, string | number | boolean | null>;
+  model_aliases?: Record<string, string | null>;
+  keys?: ProxyConfigKeyPatch[];
+}

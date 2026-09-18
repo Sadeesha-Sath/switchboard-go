@@ -1,6 +1,8 @@
 import type {
   AggregatedUsageResponse,
   MetricsSnapshot,
+  ProxyConfigPatch,
+  ProxyConfigResponse,
   StatusResponse,
   ValidateKeysResponse,
   WorkspaceUsageSnapshot,
@@ -87,4 +89,39 @@ export async function fetchWorkspaceUsage(
   apiKey: string,
 ): Promise<WorkspaceUsageSnapshot> {
   return getJSON<WorkspaceUsageSnapshot>(base, '/admin/workspace-usage', apiKey);
+}
+
+export async function fetchProxyConfig(
+  base: string,
+  apiKey: string,
+): Promise<ProxyConfigResponse> {
+  return getJSON<ProxyConfigResponse>(base, '/admin/config', apiKey);
+}
+
+export async function patchProxyConfig(
+  base: string,
+  apiKey: string,
+  patch: ProxyConfigPatch,
+): Promise<ProxyConfigResponse> {
+  const res = await fetch(`${normalizeBase(base)}/admin/config`, {
+    method: 'PATCH',
+    headers: { ...authHeaders(apiKey), 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (res.status === 401) {
+    throw new ApiError(401, 'Invalid or missing proxy API key');
+  }
+  if (!res.ok) {
+    let message = `Request failed with status ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: { message?: string } };
+      if (body.error?.message) {
+        message = body.error.message;
+      }
+    } catch {
+      // Keep the default message when the body is not JSON.
+    }
+    throw new ApiError(res.status, message);
+  }
+  return (await res.json()) as ProxyConfigResponse;
 }
