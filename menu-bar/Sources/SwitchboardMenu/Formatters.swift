@@ -17,10 +17,41 @@ enum Formatters {
         }
         let diff = target.timeIntervalSince(now)
         if diff <= 0 { return "reset due" }
-        let hours = Int(diff) / 3600
+        let totalHours = Int(diff) / 3600
+        if totalHours >= 24 {
+            let days = totalHours / 24
+            let remHours = totalHours % 24
+            if remHours > 0 { return "in \(days)d \(remHours)h" }
+            return "in \(days)d"
+        }
         let minutes = (Int(diff) % 3600) / 60
-        if hours > 0 { return "in \(hours)h \(minutes)m" }
+        if totalHours > 0 { return "in \(totalHours)h \(minutes)m" }
         return "in \(minutes)m"
+    }
+
+    /// Per-key footer: labeled rolling/weekly/monthly resets + optional error.
+    /// Checked timestamp intentionally omitted.
+    static func keyResetsFooter(
+        rolling: String?,
+        weekly: String?,
+        monthly: String?,
+        error: String?,
+        now: Date = Date()
+    ) -> String {
+        var parts: [String] = []
+        if let reset = countdown(from: rolling, now: now) {
+            parts.append("resets 5h \(reset)")
+        }
+        if let reset = countdown(from: weekly, now: now) {
+            parts.append("weekly \(reset)")
+        }
+        if let reset = countdown(from: monthly, now: now) {
+            parts.append("monthly \(reset)")
+        }
+        if let error {
+            parts.append(error)
+        }
+        return parts.joined(separator: " · ")
     }
 
     static func timeAgo(_ iso: String) -> String {

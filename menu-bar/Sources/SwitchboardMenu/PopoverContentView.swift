@@ -190,17 +190,12 @@ struct KeyRowView: View {
     }
 
     private var footerText: String {
-        var parts: [String] = []
-        if let reset = Formatters.countdown(from: key.rolling.resetsAt) {
-            parts.append("resets \(reset)")
-        }
-        if let checked = key.lastCheckedAt {
-            parts.append("checked \(Formatters.timeAgo(checked))")
-        }
-        if let error = key.error {
-            parts.append(error)
-        }
-        return parts.joined(separator: " · ")
+        Formatters.keyResetsFooter(
+            rolling: key.rolling.resetsAt,
+            weekly: key.weekly.resetsAt,
+            monthly: key.monthly.resetsAt,
+            error: key.error
+        )
     }
 }
 
