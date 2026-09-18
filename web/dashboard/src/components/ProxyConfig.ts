@@ -6,7 +6,7 @@ import type {
 } from '../types';
 import { esc } from '../utils';
 
-const DURATION_RE = /^\d+(\.\d+)?(ns|us|µs|ms|s|m|h)$/;
+const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 
 const DURATION_FIELDS: Array<{ name: keyof ProxyConfigSettings; id: string; label: string }> = [
   { name: 'session_ttl', id: 'cfg-session-ttl', label: 'Session TTL' },

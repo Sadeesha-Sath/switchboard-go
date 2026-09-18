@@ -519,3 +519,33 @@ func TestAdminConfigPatchRejectsWhenNotEditable(t *testing.T) {
 		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestSettingsStateFormatsDurationsCompactly(t *testing.T) {
+	cfg := testConfig()
+	cfg.SessionTTL = 2 * time.Hour
+	cfg.BalancedIdleTimeout = 90 * time.Minute
+	cfg.RetryExhaustedAfter = 30 * time.Second
+	cfg.UsageCheckInterval = 1500 * time.Millisecond
+	got := settingsState(cfg)
+	want := map[string]string{
+		"session_ttl":           "2h",
+		"balanced_idle_timeout": "1h30m",
+		"retry_exhausted_after": "30s",
+		"usage_check_interval":  "1s500ms",
+	}
+	actual := map[string]string{
+		"session_ttl":           got.SessionTTL,
+		"balanced_idle_timeout": got.BalancedIdleTimeout,
+		"retry_exhausted_after": got.RetryExhaustedAfter,
+		"usage_check_interval":  got.UsageCheckInterval,
+	}
+	for name, expected := range want {
+		if actual[name] != expected {
+			t.Fatalf("%s = %q, want %q", name, actual[name], expected)
+		}
+	}
+	cfg.RetryExhaustedAfter = 0
+	if got := settingsState(cfg).RetryExhaustedAfter; got != "0s" {
+		t.Fatalf("retry_exhausted_after = %q, want %q", got, "0s")
+	}
+}

@@ -72,14 +72,43 @@ func normalizedKey(kc UpstreamKeyConfig) UpstreamKeyConfig {
 func settingsState(cfg Config) configSettingsState {
 	return configSettingsState{
 		RoutingStrategy:          defaultString(cfg.RoutingStrategy, "session_sticky"),
-		SessionTTL:               cfg.SessionTTL.String(),
-		BalancedIdleTimeout:      cfg.BalancedIdleTimeout.String(),
+		SessionTTL:               formatDurationCompact(cfg.SessionTTL),
+		BalancedIdleTimeout:      formatDurationCompact(cfg.BalancedIdleTimeout),
 		ProactiveSwitchThreshold: cfg.ProactiveSwitchThreshold,
-		RetryExhaustedAfter:      cfg.RetryExhaustedAfter.String(),
-		UsageCheckInterval:       cfg.UsageCheckInterval.String(),
+		RetryExhaustedAfter:      formatDurationCompact(cfg.RetryExhaustedAfter),
+		UsageCheckInterval:       formatDurationCompact(cfg.UsageCheckInterval),
 		DisableUsagePolling:      cfg.DisableUsagePolling,
 		SanitizeDeveloperRole:    cfg.SanitizeDeveloperRole,
 	}
+}
+
+// formatDurationCompact renders a duration the way operators write it in YAML:
+// 2h instead of 2h0m0s, 90m as 1h30m, 500ms unchanged. time.ParseDuration
+// accepts every result.
+func formatDurationCompact(d time.Duration) string {
+	if d == 0 {
+		return "0s"
+	}
+	if d < time.Second {
+		return d.String()
+	}
+	var b strings.Builder
+	if hours := d / time.Hour; hours > 0 {
+		fmt.Fprintf(&b, "%dh", hours)
+		d -= hours * time.Hour
+	}
+	if mins := d / time.Minute; mins > 0 {
+		fmt.Fprintf(&b, "%dm", mins)
+		d -= mins * time.Minute
+	}
+	if secs := d / time.Second; secs > 0 {
+		fmt.Fprintf(&b, "%ds", secs)
+		d -= secs * time.Second
+	}
+	if d > 0 {
+		b.WriteString(d.String())
+	}
+	return b.String()
 }
 
 func keyStates(cfg Config) []configKeyState {
