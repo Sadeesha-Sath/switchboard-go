@@ -221,6 +221,12 @@ func buildConfigResponse(cfg Config, editable bool) configResponse {
 	}
 }
 
+func configResponseFor(cfg Config, writePath string) configResponse {
+	resp := buildConfigResponse(cfg, writePath != "")
+	resp.ConfigSource = defaultString(writePath, "none")
+	return resp
+}
+
 // configPatchRequest is the PATCH /admin/config body.
 type configPatchRequest struct {
 	IfRevision   *string                    `json:"if_revision"`
@@ -659,52 +665,60 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 }
 
 // persistConfigChanges rewrites the config file with the changed editable
-// values. It returns the previous file contents for rollback, or nil when the
-// file did not exist.
-func persistConfigChanges(path string, cfg Config, changed []string) ([]byte, error) {
+// values. It returns the previous file contents for rollback, whether the file
+// existed, and the mode to restore (0o600 for new files).
+func persistConfigChanges(path string, cfg Config, changed []string) (previous []byte, existed bool, mode os.FileMode, err error) {
 	if len(changed) == 0 {
-		return nil, nil
+		return nil, false, 0, nil
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("create config directory: %w", err)
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, false, 0, fmt.Errorf("create config directory: %w", err)
+			}
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return nil, false, 0, fmt.Errorf("chmod config directory: %w", err)
+			}
+		} else if statErr != nil {
+			return nil, false, 0, fmt.Errorf("stat config directory: %w", statErr)
 		}
 	}
-	mode := os.FileMode(0o600)
-	var previous []byte
+	mode = os.FileMode(0o600)
 	var doc yaml.Node
 	if existing, err := os.ReadFile(path); err == nil {
+		existed = true
 		previous = existing
 		if info, statErr := os.Stat(path); statErr == nil {
 			mode = info.Mode().Perm()
 		}
 		if len(existing) > 0 {
 			if err := yaml.Unmarshal(existing, &doc); err != nil {
-				return nil, fmt.Errorf("parse config file: %w", err)
+				return nil, false, 0, fmt.Errorf("parse config file: %w", err)
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return nil, false, 0, err
 	}
 	if err := applyYAMLUpdates(&doc, cfg, changed); err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
 	if err := atomicWriteFile(path, out, mode); err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
-	return previous, nil
+	return previous, existed, mode, nil
 }
 
 var loadConfigAfterPersist = loadConfig
 
 func (a *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	cfg := a.cfg()
-	editable := resolveWritableConfigPath(*cfg) != ""
-	writeJSON(w, http.StatusOK, buildConfigResponse(*cfg, editable))
+	path := resolveWritableConfigPath(*cfg)
+	writeJSON(w, http.StatusOK, configResponseFor(*cfg, path))
 }
 
 func (a *App) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +733,10 @@ func (a *App) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		writeAPIError(w, style, http.StatusBadRequest, "invalid_config", "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeAPIError(w, style, http.StatusBadRequest, "invalid_config", "invalid JSON body: unexpected trailing data")
 		return
 	}
 	if locked := envLockViolation(req, envLockedFields()); locked != "" {
@@ -743,15 +761,19 @@ func (a *App) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, style, http.StatusPreconditionFailed, "config_not_editable", "no writable config file; set SWITCHBOARD_GO_CONFIG or create a config file")
 		return
 	}
-	previous, err := persistConfigChanges(path, next, changed)
+	if len(changed) == 0 {
+		writeJSON(w, http.StatusOK, configResponseFor(current, path))
+		return
+	}
+	previous, existed, mode, err := persistConfigChanges(path, next, changed)
 	if err != nil {
 		writeAPIError(w, style, http.StatusInternalServerError, "config_apply_failed", "persist config: "+err.Error())
 		return
 	}
 	applied, err := loadConfigAfterPersist()
 	if err != nil {
-		if previous != nil {
-			_ = atomicWriteFile(path, previous, 0o600)
+		if existed {
+			_ = atomicWriteFile(path, previous, mode)
 		} else if len(changed) > 0 {
 			_ = os.Remove(path)
 		}
@@ -760,5 +782,5 @@ func (a *App) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	a.applyConfig(applied)
 	log.Printf("config updated via API: fields=%s source=%s", strings.Join(changed, ","), defaultString(applied.ConfigSourcePath, "none"))
-	writeJSON(w, http.StatusOK, buildConfigResponse(applied, true))
+	writeJSON(w, http.StatusOK, configResponseFor(applied, path))
 }

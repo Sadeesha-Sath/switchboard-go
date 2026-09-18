@@ -249,9 +249,12 @@ upstream:
 	}
 	cfg.UpstreamAPIKeys = []string{"sk-1", "sk-2"}
 
-	previous, err := persistConfigChanges(path, cfg, []string{"routing_strategy", "keys"})
+	previous, existed, _, err := persistConfigChanges(path, cfg, []string{"routing_strategy", "keys"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !existed {
+		t.Fatal("expected existed=true for existing file")
 	}
 	if previous == nil {
 		t.Fatal("expected previous file contents")
@@ -280,10 +283,11 @@ upstream:
 }
 
 func TestPersistConfigChangesCreatesMissingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	base := t.TempDir()
+	path := filepath.Join(base, "nested", "config.yaml")
 	cfg := testConfig()
 	cfg.RoutingStrategy = "fill_first"
-	if _, err := persistConfigChanges(path, cfg, []string{"routing_strategy"}); err != nil {
+	if _, _, _, err := persistConfigChanges(path, cfg, []string{"routing_strategy"}); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -292,6 +296,13 @@ func TestPersistConfigChangesCreatesMissingFile(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v", info.Mode().Perm())
+	}
+	dirInfo, err := os.Stat(filepath.Join(base, "nested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("dir mode = %v", dirInfo.Mode().Perm())
 	}
 	loaded, err := loadYAMLConfig(path)
 	if err != nil {
@@ -311,7 +322,7 @@ func TestPersistConfigChangesRemovesEmptyAliases(t *testing.T) {
 	}
 	cfg := testConfig()
 	cfg.ModelAliases = map[string]string{}
-	if _, err := persistConfigChanges(path, cfg, []string{"model_aliases"}); err != nil {
+	if _, _, _, err := persistConfigChanges(path, cfg, []string{"model_aliases"}); err != nil {
 		t.Fatal(err)
 	}
 	out, err := os.ReadFile(path)
@@ -489,6 +500,9 @@ func TestAdminConfigPatchRollsBackWhenReloadFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	original := loadConfigAfterPersist
 	loadConfigAfterPersist = func() (Config, error) { return Config{}, errors.New("boom") }
 	defer func() { loadConfigAfterPersist = original }()
@@ -503,6 +517,68 @@ func TestAdminConfigPatchRollsBackWhenReloadFails(t *testing.T) {
 	}
 	if string(after) != string(before) {
 		t.Fatalf("file not restored:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("mode = %v, want 644", info.Mode().Perm())
+	}
+}
+
+func TestConfigResponseUsesWritePath(t *testing.T) {
+	cfg := testConfig() // ConfigSourcePath is empty
+	resp := configResponseFor(cfg, "/tmp/whatever/config.yaml")
+	if resp.ConfigSource != "/tmp/whatever/config.yaml" || !resp.Editable {
+		t.Fatalf("resp = %+v", resp)
+	}
+	resp = configResponseFor(cfg, "")
+	if resp.ConfigSource != "none" || resp.Editable {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestAdminConfigPatchEmptyChangeSetIsNoop(t *testing.T) {
+	app, path := newConfigTestApp(t, configTestYAML)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getRec := serveConfig(t, app, http.MethodGet, "")
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET code = %d", getRec.Code)
+	}
+	var beforeResp configResponse
+	if err := json.Unmarshal(getRec.Body.Bytes(), &beforeResp); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serveConfig(t, app, http.MethodPatch, `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var afterResp configResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &afterResp); err != nil {
+		t.Fatal(err)
+	}
+	if afterResp.Revision != beforeResp.Revision {
+		t.Fatalf("revision changed: %s -> %s", beforeResp.Revision, afterResp.Revision)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("file changed on empty patch")
+	}
+}
+
+func TestAdminConfigPatchRejectsTrailingJSON(t *testing.T) {
+	app, _ := newConfigTestApp(t, configTestYAML)
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"routing_strategy":"balanced"}} garbage`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
 

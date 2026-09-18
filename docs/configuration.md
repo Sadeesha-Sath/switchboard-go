@@ -17,7 +17,9 @@ deployment platform.
 The dashboard's Proxy configuration dialog edits the core proxy settings and
 upstream key list at runtime. It writes to the config file the process loaded,
 or to `~/.config/switchboard-go/config.yaml` when the process started from
-environment variables only.
+environment variables only. When the file is created because the process
+started from environment variables only, it contains only the fields you
+edited and required values keep coming from the environment.
 
 - Writes preserve comments, key order, and keys the dashboard does not manage.
 - New files get `0600` permissions; new directories get `0700`.

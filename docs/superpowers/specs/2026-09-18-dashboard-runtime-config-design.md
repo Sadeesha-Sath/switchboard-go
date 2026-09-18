@@ -78,8 +78,7 @@ carry the proxy API key as `Authorization: Bearer`.
 
 - `config_source` is the path PATCH will write, or `"none"` when no path can be
   resolved.
-- `editable` is false when `config_source` is `"none"` or the config directory
-  cannot be created. Settings and masked keys are still returned.
+- `editable` is false when no writable config path can be resolved. Permission or disk failures surface on PATCH as 500. Settings and masked keys are still returned.
 - `env_locked` lists JSON field names from the table above, plus `model_aliases`
   and `keys` when their env vars are set. Values in the response are always the
   effective values after env overrides.
