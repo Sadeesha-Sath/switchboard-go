@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -88,6 +89,127 @@ func TestResolveWritableConfigPath(t *testing.T) {
 	cfg.ConfigSourcePath = ""
 	t.Setenv("SWITCHBOARD_GO_CONFIG", "/tmp/explicit.yaml")
 	if got := resolveWritableConfigPath(cfg); got != "/tmp/explicit.yaml" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func patchJSON(t *testing.T, body string) configPatchRequest {
+	t.Helper()
+	var req configPatchRequest
+	dec := json.NewDecoder(strings.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		t.Fatal(err)
+	}
+	return req
+}
+
+func TestApplyConfigPatchSettingsAndNullReset(t *testing.T) {
+	cfg := testConfig()
+	next, changed, err := applyConfigPatch(cfg, patchJSON(t, `{"settings":{"routing_strategy":"balanced","proactive_switch_threshold":80}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.RoutingStrategy != "balanced" || next.ProactiveSwitchThreshold != 80 {
+		t.Fatalf("unexpected settings: %+v", settingsState(next))
+	}
+	if len(changed) != 2 {
+		t.Fatalf("changed = %v", changed)
+	}
+
+	next, _, err = applyConfigPatch(next, patchJSON(t, `{"settings":{"routing_strategy":null,"proactive_switch_threshold":null}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.RoutingStrategy != "session_sticky" || next.ProactiveSwitchThreshold != 95 {
+		t.Fatalf("null did not reset to defaults: %+v", settingsState(next))
+	}
+}
+
+func TestApplyConfigPatchRejectsUnknownSetting(t *testing.T) {
+	_, _, err := applyConfigPatch(testConfig(), patchJSON(t, `{"settings":{"nope":1}}`))
+	if err == nil {
+		t.Fatal("expected error for unknown setting")
+	}
+}
+
+func TestApplyConfigPatchRejectsBadDuration(t *testing.T) {
+	_, _, err := applyConfigPatch(testConfig(), patchJSON(t, `{"settings":{"session_ttl":"soon"}}`))
+	if err == nil {
+		t.Fatal("expected error for bad duration")
+	}
+}
+
+func TestApplyConfigPatchAliases(t *testing.T) {
+	cfg := testConfig()
+	cfg.ModelAliases = map[string]string{"keep": "a", "drop": "b"}
+	next, _, err := applyConfigPatch(cfg, patchJSON(t, `{"model_aliases":{"drop":null,"add":"c"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := next.ModelAliases["drop"]; ok {
+		t.Fatal("drop not removed")
+	}
+	if next.ModelAliases["add"] != "c" || next.ModelAliases["keep"] != "a" {
+		t.Fatalf("aliases = %v", next.ModelAliases)
+	}
+}
+
+func TestApplyConfigPatchKeys(t *testing.T) {
+	cfg := testConfig()
+	next, changed, err := applyConfigPatch(cfg, patchJSON(t, `{"keys":[{"id":0,"priority":2},{"id":1,"key":"sk-rotated-abcdefghijkl"},{"key":"sk-new-key-123456","priority":1,"weight":4}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.UpstreamKeyConfigs) != 3 {
+		t.Fatalf("keys = %d", len(next.UpstreamKeyConfigs))
+	}
+	first := next.UpstreamKeyConfigs[0]
+	if first.Key != cfg.UpstreamKeyConfigs[0].Key || first.Priority != 2 || first.Weight != 3 {
+		t.Fatalf("first key = %+v", first)
+	}
+	if next.UpstreamKeyConfigs[1].Key != "sk-rotated-abcdefghijkl" {
+		t.Fatalf("second key = %+v", next.UpstreamKeyConfigs[1])
+	}
+	last := next.UpstreamKeyConfigs[2]
+	if last.Key != "sk-new-key-123456" || last.Priority != 1 || last.Weight != 4 {
+		t.Fatalf("new key = %+v", last)
+	}
+	if next.UpstreamAPIKeys[2] != "sk-new-key-123456" {
+		t.Fatalf("plain key list out of sync: %v", next.UpstreamAPIKeys)
+	}
+	if len(changed) != 1 || changed[0] != "keys" {
+		t.Fatalf("changed = %v", changed)
+	}
+}
+
+func TestApplyConfigPatchRejectsDuplicateKeyIDs(t *testing.T) {
+	_, _, err := applyConfigPatch(testConfig(), patchJSON(t, `{"keys":[{"id":0,"priority":1},{"id":0,"priority":2}]}`))
+	if err == nil {
+		t.Fatal("expected duplicate id error")
+	}
+}
+
+func TestApplyConfigPatchRejectsEmptyKeyList(t *testing.T) {
+	next, _, err := applyConfigPatch(testConfig(), patchJSON(t, `{"keys":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfig(next); err == nil {
+		t.Fatal("expected validation failure for empty key list")
+	}
+}
+
+func TestEnvLockViolation(t *testing.T) {
+	req := patchJSON(t, `{"settings":{"routing_strategy":"balanced"}}`)
+	if got := envLockViolation(req, []string{"routing_strategy"}); got != "routing_strategy" {
+		t.Fatalf("got %q", got)
+	}
+	if got := envLockViolation(req, []string{"session_ttl"}); got != "" {
+		t.Fatalf("got %q", got)
+	}
+	keys := patchJSON(t, `{"keys":[{"key":"sk-x-1234567890"}]}`)
+	if got := envLockViolation(keys, []string{"keys"}); got != "keys" {
 		t.Fatalf("got %q", got)
 	}
 }

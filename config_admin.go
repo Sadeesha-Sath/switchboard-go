@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
 // configSettingsState is the JSON shape of the settings the dashboard edits.
@@ -182,4 +185,247 @@ func buildConfigResponse(cfg Config, editable bool) configResponse {
 		ModelAliases: aliases,
 		Keys:         keyStates(cfg),
 	}
+}
+
+// configPatchRequest is the PATCH /admin/config body.
+type configPatchRequest struct {
+	IfRevision   *string                    `json:"if_revision"`
+	Settings     map[string]json.RawMessage `json:"settings"`
+	ModelAliases map[string]*string         `json:"model_aliases"`
+	Keys         *[]configKeyPatch          `json:"keys"`
+}
+
+type configKeyPatch struct {
+	ID       *int    `json:"id"`
+	Key      *string `json:"key"`
+	Priority *int    `json:"priority"`
+	Weight   *int    `json:"weight"`
+}
+
+func envLockViolation(req configPatchRequest, locked []string) string {
+	lockedSet := make(map[string]bool, len(locked))
+	for _, name := range locked {
+		lockedSet[name] = true
+	}
+	if req.Keys != nil && lockedSet["keys"] {
+		return "keys"
+	}
+	if req.ModelAliases != nil && lockedSet["model_aliases"] {
+		return "model_aliases"
+	}
+	for name := range req.Settings {
+		if lockedSet[name] {
+			return name
+		}
+	}
+	return ""
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
+}
+
+func decodeStringSetting(raw json.RawMessage, name, fallback string) (string, error) {
+	if isJSONNull(raw) {
+		return fallback, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil || strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("%s must be a non-empty string", name)
+	}
+	return strings.TrimSpace(s), nil
+}
+
+func decodeDurationSetting(raw json.RawMessage, name string, fallback time.Duration) (time.Duration, error) {
+	if isJSONNull(raw) {
+		return fallback, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, fmt.Errorf("%s must be a duration string", name)
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s must be a valid duration >= 0", name)
+	}
+	return d, nil
+}
+
+func decodeBoolSetting(raw json.RawMessage, name string, fallback bool) (bool, error) {
+	if isJSONNull(raw) {
+		return fallback, nil
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return b, nil
+}
+
+func decodeNumberSetting(raw json.RawMessage, name string, fallback float64) (float64, error) {
+	if isJSONNull(raw) {
+		return fallback, nil
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, fmt.Errorf("%s must be a number", name)
+	}
+	return f, nil
+}
+
+// applyConfigPatch merges the request into a copy of current. It returns the
+// merged config and the JSON names of the touched fields. The caller validates
+// the result and persists it.
+func applyConfigPatch(current Config, req configPatchRequest) (Config, []string, error) {
+	next := current
+	changed := []string{}
+	defaults := defaultConfig()
+
+	names := make([]string, 0, len(req.Settings))
+	for name := range req.Settings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		raw := req.Settings[name]
+		switch name {
+		case "routing_strategy":
+			v, err := decodeStringSetting(raw, name, defaults.RoutingStrategy)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.RoutingStrategy = v
+		case "session_ttl":
+			v, err := decodeDurationSetting(raw, name, defaults.SessionTTL)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.SessionTTL = v
+		case "balanced_idle_timeout":
+			v, err := decodeDurationSetting(raw, name, defaults.BalancedIdleTimeout)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.BalancedIdleTimeout = v
+		case "usage_check_interval":
+			v, err := decodeDurationSetting(raw, name, defaults.UsageCheckInterval)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.UsageCheckInterval = v
+		case "retry_exhausted_after":
+			v, err := decodeDurationSetting(raw, name, defaults.RetryExhaustedAfter)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.RetryExhaustedAfter = v
+		case "proactive_switch_threshold":
+			v, err := decodeNumberSetting(raw, name, defaults.ProactiveSwitchThreshold)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.ProactiveSwitchThreshold = v
+		case "disable_usage_polling":
+			v, err := decodeBoolSetting(raw, name, defaults.DisableUsagePolling)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.DisableUsagePolling = v
+		case "sanitize_developer_role":
+			v, err := decodeBoolSetting(raw, name, defaults.SanitizeDeveloperRole)
+			if err != nil {
+				return Config{}, nil, err
+			}
+			next.SanitizeDeveloperRole = v
+		default:
+			return Config{}, nil, fmt.Errorf("unknown setting %q", name)
+		}
+		changed = append(changed, name)
+	}
+
+	if req.ModelAliases != nil {
+		aliases := make(map[string]string, len(current.ModelAliases))
+		for k, v := range current.ModelAliases {
+			aliases[k] = v
+		}
+		for k, v := range req.ModelAliases {
+			name := strings.TrimSpace(k)
+			if name == "" {
+				return Config{}, nil, fmt.Errorf("model_aliases contains an empty alias name")
+			}
+			if v == nil {
+				delete(aliases, name)
+				continue
+			}
+			target := strings.TrimSpace(*v)
+			if target == "" {
+				return Config{}, nil, fmt.Errorf("model alias %q needs a non-empty target", name)
+			}
+			aliases[name] = target
+		}
+		next.ModelAliases = aliases
+		changed = append(changed, "model_aliases")
+	}
+
+	if req.Keys != nil {
+		currentConfigs := effectiveKeyConfigs(current)
+		patched := make([]UpstreamKeyConfig, 0, len(*req.Keys))
+		seenIDs := map[int]bool{}
+		seenKeys := map[string]bool{}
+		for _, kp := range *req.Keys {
+			var kc UpstreamKeyConfig
+			if kp.ID != nil {
+				id := *kp.ID
+				if id < 0 || id >= len(currentConfigs) {
+					return Config{}, nil, fmt.Errorf("key id %d is out of range", id)
+				}
+				if seenIDs[id] {
+					return Config{}, nil, fmt.Errorf("duplicate key id %d", id)
+				}
+				seenIDs[id] = true
+				kc = normalizedKey(currentConfigs[id])
+				if kp.Key != nil {
+					if strings.TrimSpace(*kp.Key) == "" {
+						return Config{}, nil, fmt.Errorf("key id %d rotation value must not be empty", id)
+					}
+					kc.Key = strings.TrimSpace(*kp.Key)
+				}
+			} else {
+				if kp.Key == nil || strings.TrimSpace(*kp.Key) == "" {
+					return Config{}, nil, fmt.Errorf("new key entries must include a non-empty key")
+				}
+				kc = UpstreamKeyConfig{Key: strings.TrimSpace(*kp.Key), Priority: 1, Weight: 1}
+			}
+			if kp.Priority != nil {
+				if *kp.Priority < 1 {
+					return Config{}, nil, fmt.Errorf("key priority must be >= 1")
+				}
+				kc.Priority = *kp.Priority
+			}
+			if kp.Weight != nil {
+				if *kp.Weight < 1 {
+					return Config{}, nil, fmt.Errorf("key weight must be >= 1")
+				}
+				kc.Weight = *kp.Weight
+			}
+			if seenKeys[kc.Key] {
+				return Config{}, nil, fmt.Errorf("duplicate key value")
+			}
+			seenKeys[kc.Key] = true
+			patched = append(patched, kc)
+		}
+		next.UpstreamKeyConfigs = patched
+		next.UpstreamAPIKeys = keysFromConfigs(patched)
+		changed = append(changed, "keys")
+	}
+
+	return next, changed, nil
+}
+
+func keysFromConfigs(configs []UpstreamKeyConfig) []string {
+	out := make([]string, len(configs))
+	for i, c := range configs {
+		out[i] = c.Key
+	}
+	return out
 }
