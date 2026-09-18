@@ -266,7 +266,7 @@ func TestAdminResetKeyRejectsBadIndex(t *testing.T) {
 
 func TestAdminResetAllKeys(t *testing.T) {
 	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"a", "b", "c"}, UpstreamBaseURL: "http://example.com", MaxRequestBodyBytes: 1})
-	for i := range app.config.UpstreamAPIKeys {
+	for i := range app.cfg().UpstreamAPIKeys {
 		app.keys.MarkExhausted(i)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/admin/reset-all-keys", nil)

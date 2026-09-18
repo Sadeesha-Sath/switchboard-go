@@ -11,8 +11,8 @@
       href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=Lora:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <script type="module" crossorigin src="/dashboard/assets/index-B7v1B3wL.js"></script>
-    <link rel="stylesheet" crossorigin href="/dashboard/assets/index-DJTxz1-C.css">
+    <script type="module" crossorigin src="/dashboard/assets/index-D4fRuAcy.js"></script>
+    <link rel="stylesheet" crossorigin href="/dashboard/assets/index-TDR6wzNU.css">
   </head>
   <body>
     <div class="dashboard-root">
@@ -57,6 +57,7 @@
               <div id="dropdown-menu" class="dropdown-menu" hidden>
                 <div class="menuitem" data-action="validate">Validate keys</div>
                 <div class="menuitem" data-action="reload">Reload config</div>
+                <div class="menuitem" data-action="proxy-config">Proxy configuration</div>
                 <div class="menuitem" data-action="settings">Settings</div>
                 <div class="rule" style="margin: var(--space-1) 0;"></div>
                 <div class="menuitem accent-item" data-action="reset-all">Reset all quotas</div>
@@ -126,6 +127,28 @@
             <div class="dialog-actions">
               <button type="button" id="clear-key" class="btn btn-secondary">Clear key</button>
               <button type="submit" class="btn btn-primary">Save changes</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Proxy Configuration Dialog -->
+    <dialog id="proxy-config-dialog" class="dialog-modal">
+      <div class="dialog-backdrop" id="proxy-config-backdrop">
+        <div class="dialog dialog-lg" role="dialog" aria-labelledby="proxy-config-title">
+          <div class="dialog-header">
+            <h2 id="proxy-config-title" class="dialog-title">Proxy Configuration</h2>
+            <button type="button" id="proxy-config-close-btn" class="iconbtn sm" aria-label="Close">&times;</button>
+          </div>
+          <form id="proxy-config-form">
+            <div id="proxy-config-body" class="dialog-body-scroll"></div>
+            <p class="dialog-body">
+              Writes to <span id="proxy-config-source" class="num">—</span>. Values set by environment variables are read-only.
+            </p>
+            <div class="dialog-actions">
+              <button type="button" id="proxy-config-refresh-btn" class="btn btn-secondary">Reload from disk</button>
+              <button type="submit" id="proxy-config-save" class="btn btn-primary">Apply changes</button>
             </div>
           </form>
         </div>

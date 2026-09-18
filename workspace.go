@@ -361,11 +361,13 @@ func (w *WorkspaceUsageClient) setSnapshotError(msg string) {
 }
 
 func (a *App) startWorkspaceUsagePoller(ctx context.Context) {
-	if a.workspace == nil || a.config.WorkspaceUsage.Interval <= 0 {
+	ws := a.workspace.Load()
+	interval := a.cfg().WorkspaceUsage.Interval
+	if ws == nil || interval <= 0 {
 		return
 	}
-	go a.workspace.Refresh(ctx)
-	ticker := time.NewTicker(a.config.WorkspaceUsage.Interval)
+	go ws.Refresh(ctx)
+	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
 		for {
@@ -373,7 +375,7 @@ func (a *App) startWorkspaceUsagePoller(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.workspace.Refresh(ctx)
+				ws.Refresh(ctx)
 			}
 		}
 	}()

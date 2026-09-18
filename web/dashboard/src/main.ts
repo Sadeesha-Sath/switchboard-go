@@ -10,6 +10,14 @@ import {
   validateKeys,
 } from './api';
 import type { AggregatedUsageResponse, MetricsSnapshot, WorkspaceUsageSnapshot } from './types';
+import { patchProxyConfig, fetchProxyConfig } from './api';
+import {
+  collectProxyConfigPatch,
+  renderNewAliasRow,
+  renderNewKeyRow,
+  renderProxyConfigForm,
+} from './components/ProxyConfig';
+import type { ProxyConfigResponse } from './types';
 import { renderPool } from './components/PoolUsage';
 import { renderKeys } from './components/KeysTable';
 import { renderMetrics } from './components/MetricsPanel';
@@ -51,6 +59,7 @@ let isPolling = false;
 let lastUsage: AggregatedUsageResponse | null = null;
 let lastSnap: MetricsSnapshot | null = null;
 let lastWorkspace: WorkspaceUsageSnapshot | null = null;
+let proxyConfig: ProxyConfigResponse | null = null;
 
 let selectedWorkspaceID: string | null = null;
 let selectedWindowKey: 'rolling' | 'weekly' | 'monthly' = 'monthly';
@@ -232,6 +241,86 @@ function tickCountdowns(): void {
   }
 }
 
+async function loadProxyConfigDialog(): Promise<void> {
+  const body = $('#proxy-config-body');
+  body.innerHTML = '<p class="text-muted">Loading proxy configuration…</p>';
+  try {
+    proxyConfig = await fetchProxyConfig(settings.baseUrl, settings.apiKey);
+    body.innerHTML = renderProxyConfigForm(proxyConfig);
+    $('#proxy-config-source').textContent =
+      proxyConfig.config_source === 'none' ? 'no config file' : proxyConfig.config_source;
+    $<HTMLButtonElement>('#proxy-config-save').disabled = !proxyConfig.editable;
+    if (!proxyConfig.editable) {
+      for (const el of body.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('input, select, button')) {
+        el.disabled = true;
+      }
+      body.insertAdjacentHTML(
+        'afterbegin',
+        '<p class="text-muted cfg-note">No writable config file found. Set SWITCHBOARD_GO_CONFIG or create a config file, then reload.</p>',
+      );
+    }
+  } catch (err) {
+    body.innerHTML = `<p class="text-muted">Could not load proxy configuration: ${esc(String(err))}</p>`;
+    $<HTMLButtonElement>('#proxy-config-save').disabled = true;
+  }
+}
+
+function openProxyConfigDialog(): void {
+  const dlg = $<HTMLDialogElement>('#proxy-config-dialog');
+  if (!dlg.open) {
+    if (typeof dlg.showModal === 'function') {
+      dlg.showModal();
+    } else {
+      dlg.setAttribute('open', '');
+    }
+  }
+  void loadProxyConfigDialog();
+}
+
+function closeProxyConfigDialog(): void {
+  const dlg = $<HTMLDialogElement>('#proxy-config-dialog');
+  if (typeof dlg.close === 'function') {
+    dlg.close();
+  } else {
+    dlg.removeAttribute('open');
+  }
+}
+
+async function saveProxyConfig(): Promise<void> {
+  if (!proxyConfig) return;
+  const root = $('#proxy-config-body');
+  const result = collectProxyConfigPatch(proxyConfig, root);
+  if (result.error) {
+    banner(result.error);
+    return;
+  }
+  if (!result.changed || !result.patch) {
+    toast('No configuration changes to apply');
+    return;
+  }
+  try {
+    const updated = await patchProxyConfig(settings.baseUrl, settings.apiKey, result.patch);
+    proxyConfig = updated;
+    root.innerHTML = renderProxyConfigForm(updated);
+    $('#proxy-config-source').textContent =
+      updated.config_source === 'none' ? 'no config file' : updated.config_source;
+    banner(null);
+    toast('Proxy configuration applied');
+    await poll(false);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      toast('Configuration changed elsewhere — reloading');
+      await loadProxyConfigDialog();
+      return;
+    }
+    if (err instanceof ApiError) {
+      banner(`Configuration update failed: ${err.message}`);
+    } else {
+      banner(`Configuration update failed: ${String(err)}`);
+    }
+  }
+}
+
 function openSettingsDialog(): void {
   const dlg = $<HTMLDialogElement>('#settings-dialog');
   $<HTMLInputElement>('#base-url').value = settings.baseUrl;
@@ -309,6 +398,10 @@ async function handleAction(action: string | undefined, indexStr: string | undef
         const bad = res.results.filter((r) => r.state === 'exhausted').length;
         toast(`Validated ${res.results.length} keys (${bad} exhausted)`);
         break;
+      }
+      case 'proxy-config': {
+        openProxyConfigDialog();
+        return;
       }
       case 'settings': {
         openSettingsDialog();
@@ -396,6 +489,21 @@ function bindEvents(): void {
   $('#settings-backdrop').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) {
       closeSettingsDialog();
+    }
+  });
+
+  $('#proxy-config-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    void saveProxyConfig();
+  });
+
+  $('#proxy-config-close-btn').addEventListener('click', closeProxyConfigDialog);
+  $('#proxy-config-refresh-btn').addEventListener('click', () => {
+    void loadProxyConfigDialog();
+  });
+  $('#proxy-config-backdrop').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) {
+      closeProxyConfigDialog();
     }
   });
 
@@ -498,6 +606,26 @@ function bindEvents(): void {
           showAllModels,
         );
       }
+      return;
+    }
+
+    if (target.closest('[data-add-key]')) {
+      $('#proxy-config-body [data-key-list]')?.insertAdjacentHTML('beforeend', renderNewKeyRow());
+      return;
+    }
+
+    if (target.closest('[data-remove-key]')) {
+      target.closest('[data-key-row]')?.remove();
+      return;
+    }
+
+    if (target.closest('[data-add-alias]')) {
+      $('#proxy-config-body [data-alias-list]')?.insertAdjacentHTML('beforeend', renderNewAliasRow());
+      return;
+    }
+
+    if (target.closest('[data-remove-alias]')) {
+      target.closest('[data-alias-row]')?.remove();
       return;
     }
 
