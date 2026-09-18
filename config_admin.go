@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	yaml "gopkg.in/yaml.v3"
 )
 
 // configSettingsState is the JSON shape of the settings the dashboard edits.
@@ -428,4 +430,239 @@ func keysFromConfigs(configs []UpstreamKeyConfig) []string {
 		out[i] = c.Key
 	}
 	return out
+}
+
+func mappingValue(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// mappingSet replaces the value in place when the key exists, so surrounding
+// comments and key order survive, or appends a new pair.
+func mappingSet(m *yaml.Node, key string, value *yaml.Node) {
+	if v := mappingValue(m, key); v != nil {
+		value.HeadComment = v.HeadComment
+		value.LineComment = v.LineComment
+		value.FootComment = v.FootComment
+		*v = *value
+		return
+	}
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		value,
+	)
+}
+
+func mappingDelete(m *yaml.Node, key string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return
+		}
+	}
+}
+
+func ensureMapping(m *yaml.Node, key string) (*yaml.Node, error) {
+	if v := mappingValue(m, key); v != nil {
+		if v.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("%s must be a mapping in the config file", key)
+		}
+		return v, nil
+	}
+	child := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	mappingSet(m, key, child)
+	return child, nil
+}
+
+func rootMapping(doc *yaml.Node) (*yaml.Node, error) {
+	if doc.Kind == 0 || len(doc.Content) == 0 {
+		root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		doc.Kind = yaml.DocumentNode
+		doc.Content = []*yaml.Node{root}
+		return root, nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("config file root must be a mapping")
+	}
+	return root, nil
+}
+
+func encodeYAMLValue(v any) (*yaml.Node, error) {
+	var n yaml.Node
+	if err := n.Encode(v); err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+func yamlSettingValue(cfg Config, name string) any {
+	switch name {
+	case "routing_strategy":
+		return defaultString(cfg.RoutingStrategy, "session_sticky")
+	case "session_ttl":
+		return cfg.SessionTTL.String()
+	case "balanced_idle_timeout":
+		return cfg.BalancedIdleTimeout.String()
+	case "proactive_switch_threshold":
+		return cfg.ProactiveSwitchThreshold
+	case "retry_exhausted_after":
+		return cfg.RetryExhaustedAfter.String()
+	case "usage_check_interval":
+		return cfg.UsageCheckInterval.String()
+	case "disable_usage_polling":
+		return cfg.DisableUsagePolling
+	case "sanitize_developer_role":
+		return cfg.SanitizeDeveloperRole
+	}
+	return nil
+}
+
+func applyYAMLUpdates(doc *yaml.Node, cfg Config, changed []string) error {
+	root, err := rootMapping(doc)
+	if err != nil {
+		return err
+	}
+	for _, name := range changed {
+		switch name {
+		case "routing_strategy", "session_ttl", "balanced_idle_timeout",
+			"proactive_switch_threshold", "retry_exhausted_after",
+			"usage_check_interval", "disable_usage_polling":
+			upstream, err := ensureMapping(root, "upstream")
+			if err != nil {
+				return err
+			}
+			value, err := encodeYAMLValue(yamlSettingValue(cfg, name))
+			if err != nil {
+				return err
+			}
+			mappingSet(upstream, name, value)
+		case "sanitize_developer_role":
+			transforms, err := ensureMapping(root, "transformations")
+			if err != nil {
+				return err
+			}
+			value, err := encodeYAMLValue(cfg.SanitizeDeveloperRole)
+			if err != nil {
+				return err
+			}
+			mappingSet(transforms, name, value)
+		case "model_aliases":
+			models, err := ensureMapping(root, "models")
+			if err != nil {
+				return err
+			}
+			if len(cfg.ModelAliases) == 0 {
+				mappingDelete(models, "aliases")
+				if len(models.Content) == 0 {
+					mappingDelete(root, "models")
+				}
+				continue
+			}
+			aliases := make(map[string]string, len(cfg.ModelAliases))
+			for k, v := range cfg.ModelAliases {
+				aliases[k] = v
+			}
+			value, err := encodeYAMLValue(aliases)
+			if err != nil {
+				return err
+			}
+			mappingSet(models, "aliases", value)
+		case "keys":
+			upstream, err := ensureMapping(root, "upstream")
+			if err != nil {
+				return err
+			}
+			type keyEntry struct {
+				Key      string `yaml:"key"`
+				Priority int    `yaml:"priority"`
+				Weight   int    `yaml:"weight"`
+			}
+			configs := effectiveKeyConfigs(cfg)
+			list := make([]keyEntry, len(configs))
+			for i, kc := range configs {
+				kc = normalizedKey(kc)
+				list[i] = keyEntry{Key: kc.Key, Priority: kc.Priority, Weight: kc.Weight}
+			}
+			value, err := encodeYAMLValue(list)
+			if err != nil {
+				return err
+			}
+			mappingSet(upstream, "api_keys", value)
+		}
+	}
+	return nil
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.yaml")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// persistConfigChanges rewrites the config file with the changed editable
+// values. It returns the previous file contents for rollback, or nil when the
+// file did not exist.
+func persistConfigChanges(path string, cfg Config, changed []string) ([]byte, error) {
+	if len(changed) == 0 {
+		return nil, nil
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("create config directory: %w", err)
+		}
+	}
+	mode := os.FileMode(0o600)
+	var previous []byte
+	var doc yaml.Node
+	if existing, err := os.ReadFile(path); err == nil {
+		previous = existing
+		if info, statErr := os.Stat(path); statErr == nil {
+			mode = info.Mode().Perm()
+		}
+		if len(existing) > 0 {
+			if err := yaml.Unmarshal(existing, &doc); err != nil {
+				return nil, fmt.Errorf("parse config file: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err := applyYAMLUpdates(&doc, cfg, changed); err != nil {
+		return nil, err
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, err
+	}
+	if err := atomicWriteFile(path, out, mode); err != nil {
+		return nil, err
+	}
+	return previous, nil
 }

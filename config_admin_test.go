@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -211,5 +213,107 @@ func TestEnvLockViolation(t *testing.T) {
 	keys := patchJSON(t, `{"keys":[{"key":"sk-x-1234567890"}]}`)
 	if got := envLockViolation(keys, []string{"keys"}); got != "keys" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPersistConfigChangesPreservesCommentsAndUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := `# top comment
+server:
+  proxy_api_key: "p" # inline
+custom:
+  keep_me: true
+upstream:
+  api_keys:
+    - key: "sk-1"
+      priority: 1
+      weight: 1
+  routing_strategy: "session_sticky"
+`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.ConfigSourcePath = path
+	cfg.RoutingStrategy = "balanced"
+	cfg.UpstreamKeyConfigs = []UpstreamKeyConfig{
+		{Key: "sk-1", Priority: 1, Weight: 1},
+		{Key: "sk-2", Priority: 2, Weight: 1},
+	}
+	cfg.UpstreamAPIKeys = []string{"sk-1", "sk-2"}
+
+	previous, err := persistConfigChanges(path, cfg, []string{"routing_strategy", "keys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if previous == nil {
+		t.Fatal("expected previous file contents")
+	}
+
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"# top comment", "keep_me", "balanced", "sk-2"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+
+	loaded, err := loadYAMLConfig(path)
+	if err != nil {
+		t.Fatalf("reload: %v\n%s", err, out)
+	}
+	if loaded.RoutingStrategy != "balanced" {
+		t.Fatalf("strategy = %q", loaded.RoutingStrategy)
+	}
+	if len(loaded.UpstreamKeyConfigs) != 2 || loaded.UpstreamKeyConfigs[1].Key != "sk-2" {
+		t.Fatalf("keys = %+v", loaded.UpstreamKeyConfigs)
+	}
+}
+
+func TestPersistConfigChangesCreatesMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	cfg := testConfig()
+	cfg.RoutingStrategy = "fill_first"
+	if _, err := persistConfigChanges(path, cfg, []string{"routing_strategy"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %v", info.Mode().Perm())
+	}
+	loaded, err := loadYAMLConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.RoutingStrategy != "fill_first" {
+		t.Fatalf("strategy = %q", loaded.RoutingStrategy)
+	}
+}
+
+func TestPersistConfigChangesRemovesEmptyAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := "models:\n  aliases:\n    a: b\nupstream:\n  api_keys: [\"sk-1\"]\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.ModelAliases = map[string]string{}
+	if _, err := persistConfigChanges(path, cfg, []string{"model_aliases"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "aliases") {
+		t.Fatalf("aliases not removed:\n%s", out)
 	}
 }
