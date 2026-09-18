@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testConfig() Config {
@@ -315,5 +319,65 @@ func TestPersistConfigChangesRemovesEmptyAliases(t *testing.T) {
 	}
 	if strings.Contains(string(out), "aliases") {
 		t.Fatalf("aliases not removed:\n%s", out)
+	}
+}
+
+func TestApplyConfigUpdatesKeyManagerAndPoller(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := defaultConfig()
+	cfg.ProxyAPIKey = "p"
+	cfg.UpstreamBaseURL = upstream.URL
+	cfg.UpstreamAPIKeys = []string{"sk-1"}
+	cfg.UpstreamKeyConfigs = []UpstreamKeyConfig{{Key: "sk-1", Priority: 1, Weight: 1}}
+	cfg.DisableUsagePolling = true
+	app := newApp(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.startUsagePoller(ctx)
+	if app.usageCancel != nil {
+		t.Fatal("poller should be off when disabled")
+	}
+
+	next := cfg
+	next.RoutingStrategy = "balanced"
+	next.DisableUsagePolling = false
+	next.UsageCheckInterval = 50 * time.Millisecond
+	next.UpstreamKeyConfigs = []UpstreamKeyConfig{
+		{Key: "sk-1", Priority: 1, Weight: 1},
+		{Key: "sk-2", Priority: 2, Weight: 1},
+	}
+	next.UpstreamAPIKeys = []string{"sk-1", "sk-2"}
+	app.applyConfig(next)
+
+	if app.cfg().RoutingStrategy != "balanced" {
+		t.Fatal("config not published")
+	}
+	if app.keys.routingStrategy != "balanced" {
+		t.Fatal("key manager not updated")
+	}
+	if len(app.keys.keys) != 2 {
+		t.Fatalf("keys not updated: %v", app.keys.keys)
+	}
+	if app.usageCancel == nil {
+		t.Fatal("poller not restarted")
+	}
+}
+
+func TestKeyPriorityAccessor(t *testing.T) {
+	km := NewKeyManagerWithKeyConfigs(
+		[]UpstreamKeyConfig{{Key: "a", Priority: 3, Weight: 1}},
+		time.Hour, "session_sticky", time.Hour, time.Hour, 95,
+	)
+	if got := km.KeyPriority(0); got != 3 {
+		t.Fatalf("got %d", got)
+	}
+	if got := km.KeyPriority(99); got != 1 {
+		t.Fatalf("got %d", got)
 	}
 }

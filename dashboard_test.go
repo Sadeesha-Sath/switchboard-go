@@ -230,8 +230,10 @@ func TestDashboardAutoKeyEmbedding(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			app := newDashboardTestApp(t)
-			app.config.ListenAddr = tc.listen
-			app.config.DashboardAutoKey = tc.setting
+			cfg := *app.cfg()
+			cfg.ListenAddr = tc.listen
+			cfg.DashboardAutoKey = tc.setting
+			app.config.Store(&cfg)
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, "/dashboard/", nil)
 			app.handleDashboard(rec, req)

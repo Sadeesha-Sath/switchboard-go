@@ -19,9 +19,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1581,6 +1583,15 @@ func (m *KeyManager) ReloadKeys(configs []UpstreamKeyConfig, cooldown time.Durat
 	}
 }
 
+func (m *KeyManager) KeyPriority(i int) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.priorities) {
+		return 1
+	}
+	return m.priorities[i]
+}
+
 func (m *KeyManager) Status() StatusResponse {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2151,12 +2162,34 @@ func (w *statusCaptureWriter) Flush() {
 }
 
 type App struct {
-	config    Config
+	config    atomic.Pointer[Config]
 	keys      *KeyManager
 	client    *http.Client
-	sender    *AlertNotifier
+	sender    atomic.Pointer[AlertNotifier]
 	metrics   *MetricsRegistry
-	workspace *WorkspaceUsageClient
+	workspace atomic.Pointer[WorkspaceUsageClient]
+
+	usageMu      sync.Mutex
+	usageBaseCtx context.Context
+	usageCancel  context.CancelFunc
+
+	configApplyMu sync.Mutex
+}
+
+func (a *App) cfg() *Config { return a.config.Load() }
+
+func (a *App) notifier() *AlertNotifier {
+	if n := a.sender.Load(); n != nil {
+		return n
+	}
+	return NewAlertNotifier(SMTPConfig{}, AlertConfig{})
+}
+
+func (a *App) workspaceClient() *WorkspaceUsageClient {
+	if w := a.workspace.Load(); w != nil {
+		return w
+	}
+	return &WorkspaceUsageClient{}
 }
 
 func newApp(cfg Config) *App {
@@ -2181,8 +2214,7 @@ func newApp(cfg Config) *App {
 		)
 	}
 	app := &App{
-		config: cfg,
-		keys:   km,
+		keys: km,
 		client: &http.Client{
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
@@ -2195,14 +2227,15 @@ func newApp(cfg Config) *App {
 				ExpectContinueTimeout: 2 * time.Second,
 			},
 		},
-		sender:  NewAlertNotifier(cfg.SMTP, cfg.Alerts),
 		metrics: NewMetricsRegistry(),
 	}
-	app.workspace = NewWorkspaceUsageClient(
+	app.config.Store(&cfg)
+	app.sender.Store(NewAlertNotifier(cfg.SMTP, cfg.Alerts))
+	app.workspace.Store(NewWorkspaceUsageClient(
 		"",
 		cfg.WorkspaceUsage.SessionCookie,
 		cfg.WorkspaceUsage.WorkspaceIDs,
-	)
+	))
 	return app
 }
 
@@ -2252,7 +2285,7 @@ func (a *App) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) authOK(r *http.Request) bool {
-	want := a.config.ProxyAPIKey
+	want := a.cfg().ProxyAPIKey
 	if want == "" {
 		return false
 	}
@@ -2297,33 +2330,47 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(a.keys.Status())
 	case r.URL.Path == "/admin/workspace-usage" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(a.workspace.Snapshot())
+		_ = json.NewEncoder(w).Encode(a.workspaceClient().Snapshot())
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (a *App) ReloadConfig() error {
-	newCfg, err := loadConfig()
-	if err != nil {
-		return fmt.Errorf("reload config failed: %w", err)
-	}
-
-	a.config = newCfg
+// applyConfig publishes newCfg to the running process.
+func (a *App) applyConfig(newCfg Config) {
+	prev := a.cfg()
+	a.config.Store(&newCfg)
 	a.keys.ReloadKeys(
-		newCfg.UpstreamKeyConfigs,
+		effectiveKeyConfigs(newCfg),
 		newCfg.RetryExhaustedAfter,
 		newCfg.RoutingStrategy,
 		newCfg.SessionTTL,
 		newCfg.BalancedIdleTimeout,
 		newCfg.ProactiveSwitchThreshold,
 	)
-	a.sender = NewAlertNotifier(newCfg.SMTP, newCfg.Alerts)
-	a.workspace = NewWorkspaceUsageClient(
-		"",
-		newCfg.WorkspaceUsage.SessionCookie,
-		newCfg.WorkspaceUsage.WorkspaceIDs,
-	)
+	if prev == nil || !reflect.DeepEqual(prev.SMTP, newCfg.SMTP) || !reflect.DeepEqual(prev.Alerts, newCfg.Alerts) {
+		a.sender.Store(NewAlertNotifier(newCfg.SMTP, newCfg.Alerts))
+	}
+	if prev == nil || !reflect.DeepEqual(prev.WorkspaceUsage, newCfg.WorkspaceUsage) {
+		a.workspace.Store(NewWorkspaceUsageClient(
+			"",
+			newCfg.WorkspaceUsage.SessionCookie,
+			newCfg.WorkspaceUsage.WorkspaceIDs,
+		))
+	}
+	if prev == nil || prev.UsageCheckInterval != newCfg.UsageCheckInterval || prev.DisableUsagePolling != newCfg.DisableUsagePolling {
+		a.restartUsagePoller()
+	}
+}
+
+func (a *App) ReloadConfig() error {
+	a.configApplyMu.Lock()
+	defer a.configApplyMu.Unlock()
+	newCfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("reload config failed: %w", err)
+	}
+	a.applyConfig(newCfg)
 	log.Printf("config reloaded: %s", safeConfigSummary(newCfg))
 	return nil
 }
@@ -2336,9 +2383,9 @@ func (a *App) handleReload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":        "ok",
 		"message":       "configuration reloaded successfully",
-		"total_keys":    len(a.config.UpstreamAPIKeys),
-		"strategy":      a.config.RoutingStrategy,
-		"config_source": defaultString(a.config.ConfigSourcePath, "none"),
+		"total_keys":    len(a.cfg().UpstreamAPIKeys),
+		"strategy":      a.cfg().RoutingStrategy,
+		"config_source": defaultString(a.cfg().ConfigSourcePath, "none"),
 	})
 }
 
@@ -2362,7 +2409,7 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
 		return
 	}
-	if body.Index < 0 || body.Index >= len(a.config.UpstreamAPIKeys) {
+	if body.Index < 0 || body.Index >= len(a.cfg().UpstreamAPIKeys) {
 		http.Error(w, "index out of range", http.StatusBadRequest)
 		return
 	}
@@ -2372,7 +2419,7 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleResetAllKeys(w http.ResponseWriter, r *http.Request) {
-	for i := range a.config.UpstreamAPIKeys {
+	for i := range a.cfg().UpstreamAPIKeys {
 		a.keys.MarkAvailable(i)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -2381,7 +2428,7 @@ func (a *App) handleResetAllKeys(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"ready": false}
-	if err := validateConfig(a.config); err != nil {
+	if err := validateConfig(*a.cfg()); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, resp)
 		return
 	}
@@ -2408,7 +2455,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (a *App) checkUpstreamReady(ctx context.Context, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.config.UpstreamBaseURL, "/")+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg().UpstreamBaseURL, "/")+"/models", nil)
 	if err != nil {
 		return err
 	}
@@ -2429,7 +2476,7 @@ func (a *App) fetchUpstreamUsage(ctx context.Context, key string) (KeyUsage, err
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	u := strings.TrimRight(a.config.UpstreamBaseURL, "/") + "/usage"
+	u := strings.TrimRight(a.cfg().UpstreamBaseURL, "/") + "/usage"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return KeyUsage{}, err
@@ -2456,7 +2503,7 @@ func (a *App) fetchUpstreamUsage(ctx context.Context, key string) (KeyUsage, err
 }
 
 func (a *App) pollAllKeysUsage(ctx context.Context) {
-	for i, key := range a.config.UpstreamAPIKeys {
+	for i, key := range a.cfg().UpstreamAPIKeys {
 		usage, err := a.fetchUpstreamUsage(ctx, key)
 		if err != nil {
 			a.keys.UpdateUsage(i, nil, err.Error())
@@ -2467,34 +2514,49 @@ func (a *App) pollAllKeysUsage(ctx context.Context) {
 }
 
 func (a *App) startUsagePoller(ctx context.Context) {
-	if a.config.DisableUsagePolling || a.config.UsageCheckInterval <= 0 {
+	a.usageMu.Lock()
+	a.usageBaseCtx = ctx
+	a.usageMu.Unlock()
+	a.restartUsagePoller()
+}
+
+func (a *App) restartUsagePoller() {
+	a.usageMu.Lock()
+	defer a.usageMu.Unlock()
+	if a.usageCancel != nil {
+		a.usageCancel()
+		a.usageCancel = nil
+	}
+	cfg := a.cfg()
+	if a.usageBaseCtx == nil || cfg.DisableUsagePolling || cfg.UsageCheckInterval <= 0 {
 		return
 	}
-	go a.pollAllKeysUsage(ctx)
-
-	ticker := time.NewTicker(a.config.UsageCheckInterval)
+	pollCtx, cancel := context.WithCancel(a.usageBaseCtx)
+	a.usageCancel = cancel
+	go a.pollAllKeysUsage(pollCtx)
+	ticker := time.NewTicker(cfg.UsageCheckInterval)
 	go func() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-pollCtx.Done():
 				return
 			case <-ticker.C:
 				if a.keys.sessionMgr != nil {
 					a.keys.sessionMgr.CleanupExpired()
 				}
-				a.pollAllKeysUsage(ctx)
+				a.pollAllKeysUsage(pollCtx)
 			}
 		}
 	}()
 }
 
 func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
-	results := make([]ValidateKeyResult, 0, len(a.config.UpstreamAPIKeys))
-	for i, key := range a.config.UpstreamAPIKeys {
+	results := make([]ValidateKeyResult, 0, len(a.cfg().UpstreamAPIKeys))
+	for i, key := range a.cfg().UpstreamAPIKeys {
 		res := ValidateKeyResult{Index: i}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.config.UpstreamBaseURL, "/")+"/models", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg().UpstreamBaseURL, "/")+"/models", nil)
 		if err != nil {
 			cancel()
 			res.State = string(KeyUnknown)
@@ -2549,7 +2611,7 @@ func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
-	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, a.cfg().MaxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if strings.Contains(err.Error(), "request body too large") {
@@ -2569,7 +2631,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 
 	tried := make(map[int]bool)
 
-	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
+	for attempts := 0; attempts < len(a.cfg().UpstreamAPIKeys); attempts++ {
 		idx, key, ok := a.keys.KeyForRequest(sessionID, tried)
 		if !ok {
 			break
@@ -2583,10 +2645,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			return
 		}
 
-		priority := 1
-		if idx < len(a.keys.priorities) {
-			priority = a.keys.priorities[idx]
-		}
+		priority := a.keys.KeyPriority(idx)
 		a.metrics.RecordUpstreamRequest(idx, priority, resp.StatusCode, upDur)
 
 		if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
@@ -2594,7 +2653,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			a.keys.MarkExhausted(idx)
 			a.metrics.RecordKeyExhaustion(idx)
 			if a.keys.ShouldNotifySwitch(idx) {
-				a.sender.NotifySwitch(idx, a.keys.Status())
+				a.notifier().NotifySwitch(idx, a.keys.Status())
 				a.metrics.RecordKeySwitch(idx, -1, "quota_429")
 			}
 			continue
@@ -2604,7 +2663,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		// flags re-arm for the next depletion round.
 		a.keys.MarkAvailable(idx)
 
-		if isModelsEndpoint && len(a.config.ModelAliases) > 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if isModelsEndpoint && len(a.cfg().ModelAliases) > 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			respBody, rErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if rErr == nil {
@@ -2630,7 +2689,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	// No eligible key remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the next probe window via Retry-After.
 	if a.keys.ShouldNotifyAllExhausted() {
-		a.sender.NotifyAllExhausted(a.keys.Status())
+		a.notifier().NotifyAllExhausted(a.keys.Status())
 	}
 	if secs, ok := a.keys.RetryAfterSeconds(); ok {
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
@@ -2648,14 +2707,14 @@ func (a *App) transformRequestBody(body []byte, isAnthropic bool) []byte {
 	}
 	mutated := false
 
-	if m, ok := raw["model"].(string); ok && len(a.config.ModelAliases) > 0 {
-		if target, exists := a.config.ModelAliases[m]; exists && target != "" {
+	if m, ok := raw["model"].(string); ok && len(a.cfg().ModelAliases) > 0 {
+		if target, exists := a.cfg().ModelAliases[m]; exists && target != "" {
 			raw["model"] = target
 			mutated = true
 		}
 	}
 
-	if !isAnthropic && a.config.SanitizeDeveloperRole {
+	if !isAnthropic && a.cfg().SanitizeDeveloperRole {
 		if msgs, ok := raw["messages"].([]any); ok {
 			for _, item := range msgs {
 				if msgObj, ok := item.(map[string]any); ok {
@@ -2695,7 +2754,7 @@ func (a *App) augmentModelsResponse(body []byte) []byte {
 			}
 		}
 	}
-	for alias := range a.config.ModelAliases {
+	for alias := range a.cfg().ModelAliases {
 		if !existing[alias] {
 			dataList = append(dataList, map[string]any{
 				"id":       alias,
@@ -2717,7 +2776,7 @@ func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key 
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	u := a.config.UpstreamBaseURL + path
+	u := a.cfg().UpstreamBaseURL + path
 	if r.URL.RawQuery != "" {
 		u += "?" + r.URL.RawQuery
 	}
@@ -2760,10 +2819,10 @@ func apiStyleForRequest(r *http.Request) APIStyle {
 }
 
 func (a *App) validateConfigAndPrint() error {
-	if err := validateConfig(a.config); err != nil {
+	if err := validateConfig(*a.cfg()); err != nil {
 		return err
 	}
-	log.Println(safeConfigSummary(a.config))
+	log.Println(safeConfigSummary(*a.cfg()))
 	return nil
 }
 

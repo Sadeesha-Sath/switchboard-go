@@ -41,13 +41,13 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 func (a *App) dashboardAutoKeyEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(a.config.DashboardAutoKey)) {
+	switch strings.ToLower(strings.TrimSpace(a.cfg().DashboardAutoKey)) {
 	case "true":
 		return true
 	case "false":
 		return false
 	default:
-		return isLoopbackListenAddr(a.config.ListenAddr)
+		return isLoopbackListenAddr(a.cfg().ListenAddr)
 	}
 }
 
@@ -61,7 +61,7 @@ func (a *App) serveDashboardIndex(w http.ResponseWriter, sub fs.FS) {
 	}
 	html := string(b)
 	if a.dashboardAutoKeyEnabled() {
-		cfgJSON, _ := json.Marshal(map[string]string{"apiKey": a.config.ProxyAPIKey})
+		cfgJSON, _ := json.Marshal(map[string]string{"apiKey": a.cfg().ProxyAPIKey})
 		html = strings.Replace(html, "<body>", "<body><script>window.__SWB_CONFIG__="+string(cfgJSON)+";</script>", 1)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -107,7 +107,7 @@ func (a *App) handleDashboardMetricsJSON(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	snap := a.metrics.Snapshot(a.keys)
-	snap.ModelAliases = a.config.ModelAliases
+	snap.ModelAliases = a.cfg().ModelAliases
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(snap)
 }
