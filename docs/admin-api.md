@@ -265,6 +265,65 @@ contents as structured JSON (request counters, latencies, per-key upstream
 traffic, exhaustions, switches, active sessions) plus `model_aliases` from the
 configuration. Like `/metrics`, it is unauthenticated and contains no API keys.
 
+## Configuration
+
+`GET /admin/config` returns the editable settings, model aliases, and masked
+upstream keys. `PATCH /admin/config` merges changes into the running config,
+writes them to the config file, and applies them without a restart. Both
+endpoints require the proxy API key.
+
+```json
+{
+  "config_source": "/home/user/.config/switchboard-go/config.yaml",
+  "editable": true,
+  "revision": "6d1f…",
+  "env_locked": ["routing_strategy"],
+  "settings": {
+    "routing_strategy": "session_sticky",
+    "session_ttl": "2h",
+    "balanced_idle_timeout": "1h",
+    "proactive_switch_threshold": 95,
+    "retry_exhausted_after": "5m",
+    "usage_check_interval": "30s",
+    "disable_usage_polling": false,
+    "sanitize_developer_role": true
+  },
+  "model_aliases": { "gpt-4o": "glm-5.1" },
+  "keys": [
+    { "id": 0, "key_hint": "sk-abcd…1234", "priority": 1, "weight": 3 }
+  ]
+}
+```
+
+PATCH accepts only the fields being changed:
+
+```json
+{
+  "if_revision": "6d1f…",
+  "settings": { "routing_strategy": "balanced", "session_ttl": null },
+  "model_aliases": { "gpt-4o": null, "claude-sonnet": "glm-5.1" },
+  "keys": [
+    { "id": 0, "priority": 2 },
+    { "id": 1, "key": "sk-rotated-value" },
+    { "key": "sk-new-key", "priority": 1, "weight": 2 }
+  ]
+}
+```
+
+- A `null` in `settings` resets that field to its default. A `null` in
+  `model_aliases` deletes the alias.
+- `keys`, when present, is the complete desired list. An entry with `id` edits
+  that key. Omit `key` to keep the secret, or include it to rotate. An entry
+  without `id` adds a key. Existing ids you leave out are removed.
+- `if_revision` is the `revision` from GET. A stale value returns 409.
+- Settings pinned by an env var (`env_locked`) return 409 when changed.
+- Status codes: 400 invalid values, 409 stale revision or env lock, 412 no
+  writable config file, 500 write or apply failure.
+
+Values are written to `config_source`, preserving comments and keys the
+dashboard does not manage. Environment variables still win over the file at
+the next load.
+
 ## Reset key manually
 
 `POST /admin/reset-key` un-marks an exhausted key immediately and makes it

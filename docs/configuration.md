@@ -12,6 +12,27 @@ This lets you keep normal settings in a config file while injecting secrets with
 environment variables, systemd environment files, Docker secrets, or your
 deployment platform.
 
+## Editing configuration from the dashboard
+
+The dashboard's Proxy configuration dialog edits the core proxy settings and
+upstream key list at runtime. It writes to the config file the process loaded,
+or to `~/.config/switchboard-go/config.yaml` when the process started from
+environment variables only.
+
+- Writes preserve comments, key order, and keys the dashboard does not manage.
+- New files get `0600` permissions; new directories get `0700`.
+- Values pinned by environment variables show as read-only, because env
+  overrides the file again at the next load.
+- Upstream key values never leave the server. The dashboard shows masked hints
+  and lets you add, remove, rotate, and re-prioritize keys.
+- Editable fields: `routing_strategy`, `session_ttl`,
+  `balanced_idle_timeout`, `proactive_switch_threshold`,
+  `retry_exhausted_after`, `usage_check_interval`,
+  `disable_usage_polling`, `sanitize_developer_role`, `models.aliases`, and
+  `upstream.api_keys`.
+- Not editable: listen address, proxy API key, upstream base URL, request body
+  limit, alerts, SMTP, and workspace usage settings.
+
 ## Config file discovery
 
 Switchboard Go looks for a config file in this order:
