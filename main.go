@@ -2331,6 +2331,10 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/admin/workspace-usage" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(a.workspaceClient().Snapshot())
+	case r.URL.Path == "/admin/config" && r.Method == http.MethodGet:
+		a.handleConfigGet(w, r)
+	case r.URL.Path == "/admin/config" && r.Method == http.MethodPatch:
+		a.handleConfigPatch(w, r)
 	default:
 		http.NotFound(w, r)
 	}

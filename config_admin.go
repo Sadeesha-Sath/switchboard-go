@@ -5,6 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -665,4 +668,68 @@ func persistConfigChanges(path string, cfg Config, changed []string) ([]byte, er
 		return nil, err
 	}
 	return previous, nil
+}
+
+var loadConfigAfterPersist = loadConfig
+
+func (a *App) handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	cfg := a.cfg()
+	editable := resolveWritableConfigPath(*cfg) != ""
+	writeJSON(w, http.StatusOK, buildConfigResponse(*cfg, editable))
+}
+
+func (a *App) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
+	style := apiStyleForRequest(r)
+
+	a.configApplyMu.Lock()
+	defer a.configApplyMu.Unlock()
+
+	current := *a.cfg()
+	var req configPatchRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeAPIError(w, style, http.StatusBadRequest, "invalid_config", "invalid JSON body: "+err.Error())
+		return
+	}
+	if locked := envLockViolation(req, envLockedFields()); locked != "" {
+		writeAPIError(w, style, http.StatusConflict, "config_env_locked", locked+" is set by an environment variable and cannot be changed here")
+		return
+	}
+	if req.IfRevision != nil && *req.IfRevision != configRevision(current) {
+		writeAPIError(w, style, http.StatusConflict, "config_revision_conflict", "configuration changed since it was loaded; reload and try again")
+		return
+	}
+	next, changed, err := applyConfigPatch(current, req)
+	if err != nil {
+		writeAPIError(w, style, http.StatusBadRequest, "invalid_config", err.Error())
+		return
+	}
+	if err := validateConfig(next); err != nil {
+		writeAPIError(w, style, http.StatusBadRequest, "invalid_config", err.Error())
+		return
+	}
+	path := resolveWritableConfigPath(current)
+	if path == "" {
+		writeAPIError(w, style, http.StatusPreconditionFailed, "config_not_editable", "no writable config file; set SWITCHBOARD_GO_CONFIG or create a config file")
+		return
+	}
+	previous, err := persistConfigChanges(path, next, changed)
+	if err != nil {
+		writeAPIError(w, style, http.StatusInternalServerError, "config_apply_failed", "persist config: "+err.Error())
+		return
+	}
+	applied, err := loadConfigAfterPersist()
+	if err != nil {
+		if previous != nil {
+			_ = atomicWriteFile(path, previous, 0o600)
+		} else if len(changed) > 0 {
+			_ = os.Remove(path)
+		}
+		writeAPIError(w, style, http.StatusInternalServerError, "config_apply_failed", "reload after write failed: "+err.Error())
+		return
+	}
+	a.applyConfig(applied)
+	log.Printf("config updated via API: fields=%s source=%s", strings.Join(changed, ","), defaultString(applied.ConfigSourcePath, "none"))
+	writeJSON(w, http.StatusOK, buildConfigResponse(applied, true))
 }

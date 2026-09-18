@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -379,5 +380,142 @@ func TestKeyPriorityAccessor(t *testing.T) {
 	}
 	if got := km.KeyPriority(99); got != 1 {
 		t.Fatalf("got %d", got)
+	}
+}
+
+const configTestYAML = `server:
+  proxy_api_key: "p"
+upstream:
+  base_url: "https://example.invalid/v1"
+  api_keys:
+    - key: "sk-abcdefghijklmnop"
+      priority: 1
+      weight: 1
+  routing_strategy: "session_sticky"
+`
+
+func newConfigTestApp(t *testing.T, contents string) (*App, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DisableUsagePolling = true
+	return newApp(cfg), path
+}
+
+func serveConfig(t *testing.T, app *App, method, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, "/admin/config", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer p")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestAdminConfigGetMasksKeys(t *testing.T) {
+	app, _ := newConfigTestApp(t, configTestYAML)
+	rec := serveConfig(t, app, http.MethodGet, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var resp configResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Keys) != 1 || resp.Keys[0].KeyHint == "sk-abcdefghijklmnop" {
+		t.Fatalf("keys = %+v", resp.Keys)
+	}
+	if resp.Revision == "" || !resp.Editable {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestAdminConfigPatchAppliesAndPersists(t *testing.T) {
+	app, path := newConfigTestApp(t, configTestYAML)
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"routing_strategy":"balanced","proactive_switch_threshold":80}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if app.cfg().RoutingStrategy != "balanced" {
+		t.Fatal("config not applied")
+	}
+	if app.keys.routingStrategy != "balanced" {
+		t.Fatal("key manager not updated")
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "balanced") {
+		t.Fatalf("file not updated:\n%s", out)
+	}
+}
+
+func TestAdminConfigPatchRejectsEnvLocked(t *testing.T) {
+	app, _ := newConfigTestApp(t, configTestYAML)
+	t.Setenv("ROUTING_STRATEGY", "balanced")
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"routing_strategy":"round_robin"}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminConfigPatchRejectsStaleRevision(t *testing.T) {
+	app, _ := newConfigTestApp(t, configTestYAML)
+	rec := serveConfig(t, app, http.MethodPatch, `{"if_revision":"deadbeef","settings":{"routing_strategy":"balanced"}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminConfigPatchRejectsUnknownSetting(t *testing.T) {
+	app, _ := newConfigTestApp(t, configTestYAML)
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"nope":1}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminConfigPatchRollsBackWhenReloadFails(t *testing.T) {
+	app, path := newConfigTestApp(t, configTestYAML)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := loadConfigAfterPersist
+	loadConfigAfterPersist = func() (Config, error) { return Config{}, errors.New("boom") }
+	defer func() { loadConfigAfterPersist = original }()
+
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"routing_strategy":"balanced"}}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("file not restored:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestAdminConfigPatchRejectsWhenNotEditable(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("SWITCHBOARD_GO_CONFIG", "")
+	cfg := defaultConfig()
+	cfg.ProxyAPIKey = "p"
+	cfg.UpstreamAPIKeys = []string{"sk-1"}
+	cfg.UpstreamKeyConfigs = []UpstreamKeyConfig{{Key: "sk-1", Priority: 1, Weight: 1}}
+	app := newApp(cfg)
+	rec := serveConfig(t, app, http.MethodPatch, `{"settings":{"routing_strategy":"balanced"}}`)
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
