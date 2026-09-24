@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // newConsoleTestServer serves the two console endpoints the client uses.
-// Requests must carry "Bearer test-key". An unknown `since` value fails the
+// Requests must carry "Bearer test-key", "Accept: application/json", and for
+// the usage endpoint "pageSize=100". An unknown `since` value fails the
 // request, so a wrong window mapping surfaces as a test failure.
 func newConsoleTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -21,6 +24,10 @@ func newConsoleTestServer(t *testing.T) *httptest.Server {
 	endsAt := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/console/api/go/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/json" {
+			http.Error(w, "expected Accept: application/json, got "+r.Header.Get("Accept"), http.StatusBadRequest)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, `{"_tag":"Unauthorized"}`)
@@ -32,6 +39,14 @@ func newConsoleTestServer(t *testing.T) *httptest.Server {
 			"month":{"limitMicroCents":"6000000000","usedMicroCents":"5084232386"}}}}`, endsAt, resetsAt, resetsAt)
 	})
 	mux.HandleFunc("/console/api/usage/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/json" {
+			http.Error(w, "expected Accept: application/json, got "+r.Header.Get("Accept"), http.StatusBadRequest)
+			return
+		}
+		if r.URL.Query().Get("pageSize") != "100" {
+			http.Error(w, "expected pageSize=100, got "+r.URL.Query().Get("pageSize"), http.StatusBadRequest)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -114,18 +129,47 @@ func TestWorkspaceClientRefreshAndSnapshot(t *testing.T) {
 }
 
 func TestWorkspaceClientUnauthorized(t *testing.T) {
-	srv := newConsoleTestServer(t)
-	c := NewWorkspaceUsageClient(srv.URL, "wrong-key")
-	err := c.Refresh(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "service API key rejected") {
-		t.Fatalf("Refresh error = %v", err)
+	const want = "service API key rejected (expired or revoked)"
+	cases := []struct {
+		name      string
+		newServer func(*testing.T) *httptest.Server
+	}{
+		{name: "401", newServer: newConsoleTestServer},
+		{
+			name: "403",
+			newServer: func(t *testing.T) *httptest.Server {
+				t.Helper()
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusForbidden)
+				}))
+				t.Cleanup(srv.Close)
+				return srv
+			},
+		},
 	}
-	snap := c.Snapshot()
-	if snap.Error != "service API key rejected (expired or revoked)" {
-		t.Fatalf("snapshot error = %q", snap.Error)
-	}
-	if !snap.Enabled {
-		t.Fatalf("snapshot should stay enabled: %+v", snap)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := tc.newServer(t)
+			c := NewWorkspaceUsageClient(srv.URL, "wrong-key")
+			err := c.Refresh(context.Background())
+			if err == nil || err.Error() != want {
+				t.Fatalf("Refresh error = %v, want %q", err, want)
+			}
+			snap := c.Snapshot()
+			if snap.Error != want {
+				t.Fatalf("snapshot error = %q", snap.Error)
+			}
+			if !snap.Enabled {
+				t.Fatalf("snapshot should stay enabled: %+v", snap)
+			}
+			if len(snap.Workspaces) != 1 {
+				t.Fatalf("workspaces = %d, want 1", len(snap.Workspaces))
+			}
+			ws := snap.Workspaces[0]
+			if ws.ID != "opencode-go" || ws.Name != "OpenCode Go" || ws.Error != want {
+				t.Fatalf("workspace = %+v", ws)
+			}
+		})
 	}
 }
 
@@ -138,6 +182,14 @@ func TestWorkspaceClientNoSubscription(t *testing.T) {
 	err := c.Refresh(context.Background())
 	if err == nil || err.Error() != "no active Go subscription for this service key" {
 		t.Fatalf("Refresh error = %v", err)
+	}
+	snap := c.Snapshot()
+	if len(snap.Workspaces) != 1 {
+		t.Fatalf("workspaces = %d, want 1", len(snap.Workspaces))
+	}
+	ws := snap.Workspaces[0]
+	if ws.ID != "opencode-go" || ws.Name != "OpenCode Go" || ws.Error != "no active Go subscription for this service key" {
+		t.Fatalf("workspace = %+v", ws)
 	}
 }
 
@@ -171,13 +223,35 @@ func TestWorkspaceClientPartialMeters(t *testing.T) {
 
 func TestWorkspaceClientPagination(t *testing.T) {
 	var requests atomic.Int32
+	var mu sync.Mutex
+	var pages []int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/console/api/go/status":
+			if r.Header.Get("Accept") != "application/json" {
+				http.Error(w, "expected Accept: application/json, got "+r.Header.Get("Accept"), http.StatusBadRequest)
+				return
+			}
 			fmt.Fprint(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":"2026-09-26T15:52:58.000Z","meters":{"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","limitMicroCents":"1200000000","usedMicroCents":"100000000"}}}}`)
 		case "/console/api/usage/models":
+			if r.Header.Get("Accept") != "application/json" {
+				http.Error(w, "expected Accept: application/json, got "+r.Header.Get("Accept"), http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Get("pageSize") != "100" {
+				http.Error(w, "expected pageSize=100, got "+r.URL.Query().Get("pageSize"), http.StatusBadRequest)
+				return
+			}
+			page, err := strconv.Atoi(r.URL.Query().Get("page"))
+			if err != nil {
+				http.Error(w, "bad page: "+r.URL.Query().Get("page"), http.StatusBadRequest)
+				return
+			}
 			requests.Add(1)
-			fmt.Fprintf(w, `{"items":[{"model":"model-%s","totalCostMicroCents":"10000000"}],"pageInfo":{"page":1,"pageCount":50}}`, r.URL.Query().Get("page"))
+			mu.Lock()
+			pages = append(pages, page)
+			mu.Unlock()
+			fmt.Fprintf(w, `{"items":[{"model":"model-%d","totalCostMicroCents":"10000000"}],"pageInfo":{"page":%d,"pageCount":50}}`, page, page)
 		default:
 			http.NotFound(w, r)
 		}
@@ -189,6 +263,17 @@ func TestWorkspaceClientPagination(t *testing.T) {
 	}
 	if got := requests.Load(); got != maxModelPages {
 		t.Fatalf("model page requests = %d, want %d", got, maxModelPages)
+	}
+	mu.Lock()
+	gotPages := append([]int(nil), pages...)
+	mu.Unlock()
+	if len(gotPages) != maxModelPages {
+		t.Fatalf("pages = %v, want 1..%d", gotPages, maxModelPages)
+	}
+	for i, p := range gotPages {
+		if p != i+1 {
+			t.Fatalf("pages = %v, want 1..%d in order", gotPages, maxModelPages)
+		}
 	}
 	rows := c.Snapshot().Workspaces[0].Windows["rolling"].Rows
 	if len(rows) != maxModelPages {
@@ -253,8 +338,16 @@ func TestWorkspaceClientMalformedJSON(t *testing.T) {
 	if err := c.Refresh(context.Background()); err == nil {
 		t.Fatal("expected decode error")
 	}
-	if c.Snapshot().Error == "" {
+	snap := c.Snapshot()
+	if snap.Error == "" {
 		t.Fatal("expected snapshot error")
+	}
+	if len(snap.Workspaces) != 1 {
+		t.Fatalf("workspaces = %d, want 1", len(snap.Workspaces))
+	}
+	ws := snap.Workspaces[0]
+	if ws.ID != "opencode-go" || ws.Name != "OpenCode Go" || ws.Error != snap.Error {
+		t.Fatalf("workspace = %+v, want error %q", ws, snap.Error)
 	}
 }
 
@@ -270,6 +363,32 @@ func TestWorkspaceClientDisabled(t *testing.T) {
 	if snap.Workspaces == nil {
 		t.Fatal("workspaces should be an empty array, not null")
 	}
+}
+
+// The poller starts even without a client so a config reload that installs one
+// (for example after key rotation) is picked up on the next tick.
+func TestWorkspaceUsagePollerPicksUpReloadedClient(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WorkspaceUsage.Interval = 20 * time.Millisecond
+	app := newApp(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.startWorkspaceUsagePoller(ctx)
+	if app.workspace.Load() != nil {
+		t.Fatal("expected no client before the reload")
+	}
+
+	srv := newConsoleTestServer(t)
+	app.workspace.Store(NewWorkspaceUsageClient(srv.URL, "test-key"))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap := app.workspace.Load().Snapshot(); len(snap.Workspaces) == 1 && snap.Workspaces[0].Error == "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("poller never refreshed the reloaded client")
 }
 
 func TestAdminWorkspaceUsageEndpoint(t *testing.T) {

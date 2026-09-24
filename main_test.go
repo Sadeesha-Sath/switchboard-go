@@ -1761,8 +1761,9 @@ workspace_usage:
 	if cfg.WorkspaceUsage.ServiceAPIKey != "" {
 		t.Fatalf("legacy cookie must not become a service key, got %q", cfg.WorkspaceUsage.ServiceAPIKey)
 	}
-	if !strings.Contains(buf.String(), "session_cookie is no longer supported") {
-		t.Fatalf("expected a deprecation warning, got %q", buf.String())
+	const want = "workspace_usage.session_cookie is no longer supported and was ignored; use workspace_usage.service_api_key"
+	if !strings.Contains(buf.String(), want) {
+		t.Fatalf("expected the full deprecation warning %q, got %q", want, buf.String())
 	}
 }
 

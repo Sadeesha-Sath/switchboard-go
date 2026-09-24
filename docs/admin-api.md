@@ -202,7 +202,7 @@ Example response:
 }
 ```
 
-One service key is bound to one workspace. Each workspace has up to three windows (`rolling`, `weekly`, `monthly`), each with `status`, `usage_usd`, `limit_usd`, `usage_percent`, `reset_in_sec`, and per-model `rows` (`model`, `name`, `cost`, `quota_cost`, `contribution_percent`, `estimated`). Window totals come from the Go subscription meters; rows come from usage records, so row sums can be lower than the window total. Rows no longer carry a `multiplier`, and `name` equals the model id. On failure the top-level `error` field is set and the dashboard shows an error. See [Configuration](configuration.md#workspace-usage) for setup.
+One service key is bound to one workspace. Each workspace has up to three windows (`rolling`, `weekly`, `monthly`), each with `status`, `usage_usd`, `limit_usd`, `usage_percent`, `reset_in_sec`, and per-model `rows` (`model`, `name`, `cost`, `quota_cost`, `contribution_percent`, `estimated`). Window totals come from the Go subscription meters; rows come from usage records, so row sums can be lower than the window total. Rows no longer carry a `multiplier`, and `name` equals the model id. On failure the `error` field is set at the top level or on the workspace entry, and the dashboard shows an error. See [Configuration](configuration.md#workspace-usage) for setup.
 
 ## Prometheus Metrics
 

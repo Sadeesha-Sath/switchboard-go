@@ -189,7 +189,7 @@ server:
 | `workspace_usage.interval` | `60s` | Polling interval for console reads. `0` disables background polling. Must be `>= 0`. |
 | `server.dashboard_auto_key` | `"auto"` | Controls whether the dashboard HTML embeds the proxy key for first-load convenience. `auto` embeds only when `listen_addr` is loopback (`127.0.0.1`, `::1`, `localhost`); `true` always embeds; `false` never embeds. The Settings panel override in localStorage still takes precedence. |
 
-A config that still sets the removed `session_cookie` or `workspace_ids` fields loads, logs a warning, and ignores them.
+A config that still sets the removed `session_cookie` field loads, logs a warning, and ignores it. A config that still sets the removed `workspace_ids` field loads and silently ignores it.
 
 ### Environment variables
 

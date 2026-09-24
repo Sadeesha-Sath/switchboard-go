@@ -255,12 +255,12 @@ func (w *WorkspaceUsageClient) Refresh(ctx context.Context) error {
 func (w *WorkspaceUsageClient) refreshOnce(ctx context.Context) error {
 	var status goStatusResponse
 	if err := w.getJSON(ctx, goStatusPath, nil, &status); err != nil {
-		w.setSnapshotError(err.Error())
+		w.setError(err.Error())
 		return err
 	}
 	if status.Access == nil {
 		err := errors.New("no active Go subscription for this service key")
-		w.setSnapshotError(err.Error())
+		w.setError(err.Error())
 		return err
 	}
 	ws := WorkspaceStatus{ID: "opencode-go", Name: "OpenCode Go", Windows: map[string]WorkspaceWindowSnapshot{}}
@@ -296,28 +296,41 @@ func (w *WorkspaceUsageClient) refreshOnce(ctx context.Context) error {
 	return nil
 }
 
-func (w *WorkspaceUsageClient) setSnapshotError(msg string) {
+// setError records a failure both at the top level and on the single workspace
+// entry, so the dashboard's per-workspace banner shows even when an earlier
+// refresh left usable data behind.
+func (w *WorkspaceUsageClient) setError(msg string) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.snapshot.Error = msg
-	w.mu.Unlock()
+	w.snapshot.Workspaces = []WorkspaceStatus{{
+		ID:      "opencode-go",
+		Name:    "OpenCode Go",
+		Windows: map[string]WorkspaceWindowSnapshot{},
+		Error:   msg,
+	}}
 }
 
 func (a *App) startWorkspaceUsagePoller(ctx context.Context) {
-	ws := a.workspace.Load()
-	interval := a.cfg().WorkspaceUsage.Interval
-	if ws == nil || interval <= 0 {
-		return
-	}
-	go ws.Refresh(ctx)
-	ticker := time.NewTicker(interval)
 	go func() {
-		defer ticker.Stop()
 		for {
+			interval := a.cfg().WorkspaceUsage.Interval
+			if interval <= 0 {
+				// Polling disabled. Re-check periodically so a reload can enable it.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Minute):
+					continue
+				}
+			}
+			if ws := a.workspace.Load(); ws != nil {
+				ws.Refresh(ctx)
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				ws.Refresh(ctx)
+			case <-time.After(interval):
 			}
 		}
 	}()
