@@ -9,177 +9,266 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
-const (
-	fakeHashWorkspaces   = "1111111111111111111111111111111111111111111111111111111111111111"
-	fakeHashSubscription = "2222222222222222222222222222222222222222222222222222222222222222"
-	fakeHashDetails      = "3333333333333333333333333333333333333333333333333333333333333333"
-)
-
-func wrapRoot(expr string) string {
-	return fmt.Sprintf(`((self.$R=self.$R||{})["server-fn:0"]=[],($R=>$R[0]=%s)($R["server-fn:0"]))`, expr)
-}
-
-// newWorkspaceTestServer simulates the landing page, bundle chain, and /_server.
-func newWorkspaceTestServer(t *testing.T, failFirstCall *atomic.Bool) *httptest.Server {
+// newConsoleTestServer serves the two console endpoints the client uses.
+// Requests must carry "Bearer test-key". An unknown `since` value fails the
+// request, so a wrong window mapping surfaces as a test failure.
+func newConsoleTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	resetsAt := time.Now().Add(90 * time.Minute).UTC().Format(time.RFC3339)
+	endsAt := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			fmt.Fprint(w, `<html><script src="/_build/assets/entry-client-ABC.js"></script></html>`)
+	mux.HandleFunc("/console/api/go/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"_tag":"Unauthorized"}`)
 			return
 		}
-		http.NotFound(w, r)
+		fmt.Fprintf(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":%q,"meters":{
+			"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","resetsAt":%q,"limitMicroCents":"1200000000","usedMicroCents":"84289897"},
+			"week":{"startsAt":"2026-09-21T00:00:00.000Z","resetsAt":%q,"limitMicroCents":"3000000000","usedMicroCents":"1013236711"},
+			"month":{"limitMicroCents":"6000000000","usedMicroCents":"5084232386"}}}}`, endsAt, resetsAt, resetsAt)
 	})
-	mux.HandleFunc("/_build/assets/entry-client-ABC.js", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `import("./workspace-XYZ.js");import("./index-GO1.js")`)
-	})
-	mux.HandleFunc("/_build/assets/workspace-XYZ.js", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `const getWorkspaces_query = createServerReference("%s")`, fakeHashWorkspaces)
-	})
-	mux.HandleFunc("/_build/assets/index-GO1.js", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `const queryLiteSubscription_query = createServerReference("%s");const queryLiteUsageDetails_query = createServerReference("%s")`, fakeHashSubscription, fakeHashDetails)
-	})
-	mux.HandleFunc("/_server", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Cookie") != "auth=test-cookie" {
+	mux.HandleFunc("/console/api/usage/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if failFirstCall != nil && failFirstCall.Load() {
-			failFirstCall.Store(false)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		id := r.URL.Query().Get("id")
-		args := r.URL.Query().Get("args")
-		switch id {
-		case fakeHashWorkspaces:
-			fmt.Fprint(w, frame(wrapRoot(`[{id:"wrk_test1",name:"Default",slug:null},{id:"wrk_test2",name:"Workspace 2",slug:null}]`)))
-		case fakeHashSubscription:
-			if !strings.Contains(args, "wrk_test1") {
-				http.Error(w, "unexpected workspace", http.StatusBadRequest)
-				return
-			}
-			fmt.Fprint(w, frame(wrapRoot(`{mine:!0,useBalance:!1,allowTraining:!0,region:["us"],rollingUsage:{status:"ok",resetInSec:10901,usagePercent:16.4,usage:197024067,limit:1200000000},weeklyUsage:{status:"ok",resetInSec:392081,usagePercent:12.6,usage:379299700,limit:3000000000},monthlyUsage:{status:"ok",resetInSec:2447083,usagePercent:6.3,usage:379299700,limit:6000000000}}`)))
-		case fakeHashDetails:
-			switch {
-			case strings.Contains(args, `"rolling"`):
-				fmt.Fprint(w, frame(wrapRoot(`{usage:197024067,limit:1200000000,usagePercent:16.4,rows:[{model:"glm-5.3-flash",name:"GLM 5.3 Flash",cost:89949456,quotaCost:179898912,multiplier:2,estimated:!1,contributionPercent:15}]}`)))
-			case strings.Contains(args, `"weekly"`):
-				fmt.Fprint(w, frame(wrapRoot(`{usage:379299700,limit:3000000000,usagePercent:12.6,rows:[{model:"glm-5.3-flash",name:"GLM 5.3 Flash",cost:89949456,quotaCost:179898912,multiplier:2,estimated:!1,contributionPercent:6.3}]}`)))
-			default:
-				fmt.Fprint(w, frame(wrapRoot(`{usage:379299700,limit:6000000000,usagePercent:6.3,rows:[{model:"glm-5.3-flash",name:"GLM 5.3 Flash",cost:89949456,quotaCost:179898912,multiplier:2,estimated:!1,contributionPercent:5.9},{model:"muse-spark-1.2-contributor",name:"Muse Spark 1.2 Contributor",cost:22184350,quotaCost:22184350,multiplier:1,estimated:!1,contributionPercent:0.4}]}`)))
-			}
+		switch r.URL.Query().Get("since") {
+		case "2026-09-24T04:59:21.277Z":
+			fmt.Fprint(w, `{"items":[{"model":"deepseek-v4.1-flash","totalCostMicroCents":"105967287"}],"pageInfo":{"page":1,"pageCount":1}}`)
+		case "2026-09-21T00:00:00.000Z":
+			fmt.Fprint(w, `{"items":[{"model":"deepseek-v4.1-flash","totalCostMicroCents":"579970673"},{"model":"muse-spark-1.3-contributor","totalCostMicroCents":"56639134"}],"pageInfo":{"page":1,"pageCount":1}}`)
+		case "2026-08-26T15:52:58.000Z":
+			fmt.Fprint(w, `{"items":[{"model":"deepseek-v4.1-flash","totalCostMicroCents":"546483151"}],"pageInfo":{"page":1,"pageCount":1}}`)
 		default:
-			http.Error(w, "unknown id", http.StatusNotFound)
+			http.Error(w, "unexpected since "+r.URL.Query().Get("since"), http.StatusBadRequest)
 		}
 	})
-	return httptest.NewServer(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func TestWorkspaceClientRefreshAndSnapshot(t *testing.T) {
-	srv := newWorkspaceTestServer(t, nil)
-	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
-	ctx := context.Background()
-	if err := c.Refresh(ctx); err != nil {
+	srv := newConsoleTestServer(t)
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	if !c.Enabled() {
+		t.Fatal("client should be enabled")
+	}
+	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	snap := c.Snapshot()
 	if !snap.Enabled || snap.UpdatedAt == "" {
 		t.Fatalf("snapshot not populated: %+v", snap)
 	}
-	if len(snap.Workspaces) != 2 {
-		t.Fatalf("workspaces = %d, want 2", len(snap.Workspaces))
+	if len(snap.Workspaces) != 1 {
+		t.Fatalf("workspaces = %d, want 1", len(snap.Workspaces))
 	}
 	ws := snap.Workspaces[0]
-	if ws.ID != "wrk_test1" || ws.Name != "Default" {
-		t.Fatalf("ws[0] = %+v", ws)
+	if ws.ID != "opencode-go" || ws.Name != "OpenCode Go" || ws.Error != "" {
+		t.Fatalf("workspace = %+v", ws)
 	}
-	roll := ws.Windows["rolling"]
-	if roll.Status != "ok" || roll.UsagePercent != 16.4 {
-		t.Fatalf("rolling window = %+v", roll)
+	roll, ok := ws.Windows["rolling"]
+	if !ok {
+		t.Fatal("rolling window missing")
 	}
-	if len(roll.Rows) != 1 || roll.Rows[0].Model != "glm-5.3-flash" {
+	if roll.Status != "ok" || roll.UsagePercent != 7.0 {
+		t.Fatalf("rolling = %+v", roll)
+	}
+	if roll.UsageUSD != 84289897.0/1e8 || roll.LimitUSD != 12.0 {
+		t.Fatalf("rolling USD = %v/%v", roll.UsageUSD, roll.LimitUSD)
+	}
+	if roll.ResetInSec < 85*60 || roll.ResetInSec > 90*60 {
+		t.Fatalf("rolling reset = %v, want about 90m", roll.ResetInSec)
+	}
+	if len(roll.Rows) != 1 || roll.Rows[0].Model != "deepseek-v4.1-flash" {
 		t.Fatalf("rolling rows = %+v", roll.Rows)
 	}
-	wantCost := 89949456.0 / 1e8
-	if roll.Rows[0].Cost != wantCost || roll.Rows[0].QuotaCost != 2*wantCost {
-		t.Fatalf("row costs = %v/%v, want %v/%v", roll.Rows[0].Cost, roll.Rows[0].QuotaCost, wantCost, 2*wantCost)
+	if roll.Rows[0].Cost != 105967287.0/1e8 || roll.Rows[0].QuotaCost != roll.Rows[0].Cost {
+		t.Fatalf("row costs = %+v", roll.Rows[0])
 	}
-	if roll.Rows[0].Multiplier == nil || *roll.Rows[0].Multiplier != 2 {
-		t.Fatalf("multiplier = %+v, want 2", roll.Rows[0].Multiplier)
+	if roll.Rows[0].Multiplier != nil || roll.Rows[0].Estimated {
+		t.Fatalf("row flags = %+v", roll.Rows[0])
 	}
-	if roll.UsageUSD != 197024067.0/1e8 || roll.LimitUSD != 12.0 {
-		t.Fatalf("rolling usage/limit USD = %v/%v", roll.UsageUSD, roll.LimitUSD)
+	if roll.Rows[0].ContributionPercent != 100.0 {
+		t.Fatalf("contribution = %v, want 100", roll.Rows[0].ContributionPercent)
 	}
-	if _, ok := ws.Windows["monthly"]; !ok {
-		t.Fatalf("monthly window missing")
+	week := ws.Windows["weekly"]
+	if len(week.Rows) != 2 || week.Rows[0].Model != "deepseek-v4.1-flash" || week.Rows[1].Model != "muse-spark-1.3-contributor" {
+		t.Fatalf("weekly rows = %+v", week.Rows)
 	}
-	// Second refresh reuses cached hashes; must still succeed.
-	if err := c.Refresh(ctx); err != nil {
-		t.Fatalf("second Refresh: %v", err)
+	if week.Rows[0].ContributionPercent != 91.1 || week.Rows[1].ContributionPercent != 8.9 {
+		t.Fatalf("weekly contributions = %v/%v", week.Rows[0].ContributionPercent, week.Rows[1].ContributionPercent)
 	}
-}
-
-func TestWorkspaceClientWorkspaceIDFilter(t *testing.T) {
-	srv := newWorkspaceTestServer(t, nil)
-	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", []string{"wrk_test2"})
-	if err := c.Refresh(context.Background()); err != nil {
-		t.Fatalf("Refresh: %v", err)
+	month := ws.Windows["monthly"]
+	if month.ResetInSec <= 0 {
+		t.Fatalf("monthly reset should come from access.endsAt: %v", month.ResetInSec)
 	}
-	snap := c.Snapshot()
-	if len(snap.Workspaces) != 1 || snap.Workspaces[0].ID != "wrk_test2" {
-		t.Fatalf("filtered workspaces = %+v", snap.Workspaces)
+	if len(month.Rows) != 1 || month.Rows[0].Cost != 546483151.0/1e8 {
+		t.Fatalf("monthly rows = %+v", month.Rows)
 	}
 }
 
 func TestWorkspaceClientUnauthorized(t *testing.T) {
-	srv := newWorkspaceTestServer(t, nil)
-	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "wrong-cookie", nil)
-	if err := c.Refresh(context.Background()); err == nil {
-		t.Fatal("expected error for unauthorized refresh")
+	srv := newConsoleTestServer(t)
+	c := NewWorkspaceUsageClient(srv.URL, "wrong-key")
+	err := c.Refresh(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "service API key rejected") {
+		t.Fatalf("Refresh error = %v", err)
 	}
 	snap := c.Snapshot()
-	if snap.Error == "" {
-		t.Fatalf("expected snapshot.Error to be set: %+v", snap)
+	if snap.Error != "service API key rejected (expired or revoked)" {
+		t.Fatalf("snapshot error = %q", snap.Error)
+	}
+	if !snap.Enabled {
+		t.Fatalf("snapshot should stay enabled: %+v", snap)
 	}
 }
 
-func TestWorkspaceClientRetriesAfterServerError(t *testing.T) {
-	fail := atomic.Bool{}
-	fail.Store(true)
-	srv := newWorkspaceTestServer(t, &fail)
-	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
-	if err := c.Refresh(context.Background()); err != nil {
-		t.Fatalf("Refresh should self-heal after a 500: %v", err)
-	}
-	snap := c.Snapshot()
-	if snap.Error != "" || len(snap.Workspaces) != 2 {
-		t.Fatalf("snapshot after retry = %+v", snap)
-	}
-}
-
-func TestWorkspaceClientDiscoveryFailure(t *testing.T) {
+func TestWorkspaceClientNoSubscription(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			fmt.Fprint(w, `<html><body>no scripts here</body></html>`)
-			return
-		}
-		http.NotFound(w, r)
+		fmt.Fprint(w, `{"product":"go"}`)
 	}))
 	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	err := c.Refresh(context.Background())
+	if err == nil || err.Error() != "no active Go subscription for this service key" {
+		t.Fatalf("Refresh error = %v", err)
+	}
+}
+
+func TestWorkspaceClientPartialMeters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/console/api/go/status":
+			fmt.Fprint(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":"2026-09-26T15:52:58.000Z","meters":{"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","resetsAt":"2026-09-24T09:59:21.277Z","limitMicroCents":"1200000000","usedMicroCents":"84289897"}}}}`)
+		case "/console/api/usage/models":
+			fmt.Fprint(w, `{"items":[],"pageInfo":{"page":1,"pageCount":1}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	ws := c.Snapshot().Workspaces[0]
+	if _, ok := ws.Windows["rolling"]; !ok {
+		t.Fatal("rolling window missing")
+	}
+	if _, ok := ws.Windows["weekly"]; ok {
+		t.Fatal("weekly window should be omitted when the meter is absent")
+	}
+	if _, ok := ws.Windows["monthly"]; ok {
+		t.Fatal("monthly window should be omitted when the meter is absent")
+	}
+}
+
+func TestWorkspaceClientPagination(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/console/api/go/status":
+			fmt.Fprint(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":"2026-09-26T15:52:58.000Z","meters":{"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","limitMicroCents":"1200000000","usedMicroCents":"100000000"}}}}`)
+		case "/console/api/usage/models":
+			requests.Add(1)
+			fmt.Fprintf(w, `{"items":[{"model":"model-%s","totalCostMicroCents":"10000000"}],"pageInfo":{"page":1,"pageCount":50}}`, r.URL.Query().Get("page"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := requests.Load(); got != maxModelPages {
+		t.Fatalf("model page requests = %d, want %d", got, maxModelPages)
+	}
+	rows := c.Snapshot().Workspaces[0].Windows["rolling"].Rows
+	if len(rows) != maxModelPages {
+		t.Fatalf("rows = %d, want %d", len(rows), maxModelPages)
+	}
+}
+
+func TestWorkspaceClientZeroCostRows(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/console/api/go/status":
+			fmt.Fprint(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":"2026-09-26T15:52:58.000Z","meters":{"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","limitMicroCents":"0","usedMicroCents":"0"}}}}`)
+		case "/console/api/usage/models":
+			fmt.Fprint(w, `{"items":[{"model":"free-model","totalCostMicroCents":"0"}],"pageInfo":{"page":1,"pageCount":1}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	win := c.Snapshot().Workspaces[0].Windows["rolling"]
+	if win.UsagePercent != 0 || win.LimitUSD != 0 {
+		t.Fatalf("zero limit window = %+v", win)
+	}
+	if len(win.Rows) != 1 || win.Rows[0].ContributionPercent != 0 {
+		t.Fatalf("rows = %+v", win.Rows)
+	}
+}
+
+func TestWorkspaceClientWindowFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/console/api/go/status":
+			fmt.Fprint(w, `{"product":"go","access":{"startsAt":"2026-08-26T15:52:58.000Z","endsAt":"2026-09-26T15:52:58.000Z","meters":{"fiveHour":{"startsAt":"2026-09-24T04:59:21.277Z","limitMicroCents":"1200000000","usedMicroCents":"100000000"}}}}`)
+		default:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("window failure should not fail the refresh: %v", err)
+	}
+	ws := c.Snapshot().Workspaces[0]
+	if !strings.Contains(ws.Error, "models(rolling)") {
+		t.Fatalf("workspace error = %q", ws.Error)
+	}
+	if len(ws.Windows) != 0 {
+		t.Fatalf("windows = %+v, want none", ws.Windows)
+	}
+}
+
+func TestWorkspaceClientMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"product":`)
+	}))
+	defer srv.Close()
+	c := NewWorkspaceUsageClient(srv.URL, "test-key")
 	if err := c.Refresh(context.Background()); err == nil {
-		t.Fatal("expected discovery failure error")
+		t.Fatal("expected decode error")
+	}
+	if c.Snapshot().Error == "" {
+		t.Fatal("expected snapshot error")
+	}
+}
+
+func TestWorkspaceClientDisabled(t *testing.T) {
+	c := NewWorkspaceUsageClient("", "")
+	if c != nil {
+		t.Fatalf("client = %+v, want nil without a key", c)
 	}
 	snap := c.Snapshot()
-	if !snap.Enabled || snap.Error == "" {
-		t.Fatalf("snapshot should stay enabled with error set: %+v", snap)
+	if snap.Enabled {
+		t.Fatalf("nil client should report disabled: %+v", snap)
+	}
+	if snap.Workspaces == nil {
+		t.Fatal("workspaces should be an empty array, not null")
 	}
 }
 
@@ -212,37 +301,9 @@ func TestAdminWorkspaceUsageEndpoint(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if snap.Enabled {
-		t.Fatalf("feature should be disabled without a cookie: %+v", snap)
+		t.Fatalf("feature should be disabled without a service key: %+v", snap)
 	}
 	if snap.Workspaces == nil {
 		t.Fatalf("workspaces should be an empty array, not null")
-	}
-}
-
-func TestWorkspaceClientDiscoveryNewBundleFormat(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html><script src="/_build/assets/entry-client-NEW.js"></script></html>`)
-	})
-	mux.HandleFunc("/_build/assets/entry-client-NEW.js", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `"build": () => __vitePreload(() => import(
-  /* @vite-ignore */
-  "./go-PAGE.js"
-), true ? __vite__mapDeps([1,2]) : void 0)`)
-	})
-	mux.HandleFunc("/_build/assets/go-PAGE.js", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `const queryLiteSubscription_query = createServerReference("%s");const queryLiteUsageDetails_query = createServerReference("%s");const getWorkspaces_query = createServerReference("%s")`, fakeHashSubscription, fakeHashDetails, fakeHashWorkspaces)
-	})
-	mux.HandleFunc("/_server", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, frame(wrapRoot(`[{id:"wrk_test1",name:"Default",slug:null},{id:"wrk_test2",name:"Workspace 2",slug:null}]`)))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-	c := NewWorkspaceUsageClient(srv.URL, "test-cookie", nil)
-	if err := c.Refresh(context.Background()); err != nil {
-		t.Fatalf("discovery must survive vite-preload import formatting: %v", err)
-	}
-	if snap := c.Snapshot(); len(snap.Workspaces) != 2 {
-		t.Fatalf("workspaces = %d, want 2", len(snap.Workspaces))
 	}
 }

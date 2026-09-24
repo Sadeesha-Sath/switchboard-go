@@ -2234,7 +2234,6 @@ func newApp(cfg Config) *App {
 	app.workspace.Store(NewWorkspaceUsageClient(
 		"",
 		cfg.WorkspaceUsage.SessionCookie,
-		cfg.WorkspaceUsage.WorkspaceIDs,
 	))
 	return app
 }
@@ -2359,7 +2358,6 @@ func (a *App) applyConfig(newCfg Config) {
 		a.workspace.Store(NewWorkspaceUsageClient(
 			"",
 			newCfg.WorkspaceUsage.SessionCookie,
-			newCfg.WorkspaceUsage.WorkspaceIDs,
 		))
 	}
 	if prev == nil || prev.UsageCheckInterval != newCfg.UsageCheckInterval || prev.DisableUsagePolling != newCfg.DisableUsagePolling {

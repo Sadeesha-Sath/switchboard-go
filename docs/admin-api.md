@@ -161,7 +161,7 @@ Example response:
 
 ## Workspace usage
 
-`GET /admin/workspace-usage` returns the last scraped per-workspace per-model cost and quota breakdown from the OpenCode console. Requires `Authorization: Bearer <PROXY_API_KEY>`. When workspace scraping is disabled (no `workspace_usage.session_cookie`), it returns `{"enabled": false, "workspaces": []}`.
+`GET /admin/workspace-usage` returns the last per-model cost and quota breakdown read from the OpenCode console API. Requires `Authorization: Bearer <PROXY_API_KEY>`. When the feature is disabled (no `workspace_usage.service_api_key`), it returns `{"enabled": false, "workspaces": []}`.
 
 ```bash
 curl http://127.0.0.1:8080/admin/workspace-usage \
@@ -173,26 +173,25 @@ Example response:
 ```json
 {
   "enabled": true,
-  "updated_at": "2026-09-02T12:00:00Z",
+  "updated_at": "2026-09-24T06:30:00Z",
   "workspaces": [
     {
-      "id": "wrk_example",
-      "name": "Default",
+      "id": "opencode-go",
+      "name": "OpenCode Go",
       "windows": {
         "monthly": {
           "status": "ok",
-          "usage_usd": 3.78193408,
+          "usage_usd": 50.84232386,
           "limit_usd": 60.0,
-          "usage_percent": 6.3,
-          "reset_in_sec": 2447083,
+          "usage_percent": 84.7,
+          "reset_in_sec": 172800,
           "rows": [
             {
-              "model": "glm-5.3-flash",
-              "name": "GLM 5.3 Flash",
-              "cost": 1.78004529,
-              "quota_cost": 3.56009058,
-              "multiplier": 2.0,
-              "contribution_percent": 5.9,
+              "model": "deepseek-v4.1-flash",
+              "name": "deepseek-v4.1-flash",
+              "cost": 5.46483151,
+              "quota_cost": 5.46483151,
+              "contribution_percent": 100.0,
               "estimated": false
             }
           ]
@@ -203,7 +202,7 @@ Example response:
 }
 ```
 
-Each workspace has up to three windows (`five_hour`, `weekly`, `monthly`), each with `status`, `usage_usd`, `limit_usd`, `usage_percent`, `reset_in_sec`, and per-model `rows` (`model`, `name`, `cost`, `quota_cost`, `multiplier`, `contribution_percent`, `estimated`). On scrape failure the top-level `error` field is set and the dashboard shows an error. See [Configuration](configuration.md#workspace-usage-scraping) for setup.
+One service key is bound to one workspace. Each workspace has up to three windows (`rolling`, `weekly`, `monthly`), each with `status`, `usage_usd`, `limit_usd`, `usage_percent`, `reset_in_sec`, and per-model `rows` (`model`, `name`, `cost`, `quota_cost`, `contribution_percent`, `estimated`). Window totals come from the Go subscription meters; rows come from usage records, so row sums can be lower than the window total. Rows no longer carry a `multiplier`, and `name` equals the model id. On failure the top-level `error` field is set and the dashboard shows an error. See [Configuration](configuration.md#workspace-usage-scraping) for setup.
 
 ## Prometheus Metrics
 
