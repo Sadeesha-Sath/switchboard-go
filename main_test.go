@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1651,8 +1652,7 @@ server:
 upstream:
   api_keys: ["sk-1"]
 workspace_usage:
-  session_cookie: "Fe26.2**test"
-  workspace_ids: ["wrk_a", "wrk_b"]
+  service_api_key: "oc_sk_test"
   interval: "90s"
 `
 	dir := t.TempDir()
@@ -1664,11 +1664,8 @@ workspace_usage:
 	if err != nil {
 		t.Fatalf("loadYAMLConfig: %v", err)
 	}
-	if cfg.WorkspaceUsage.SessionCookie != "Fe26.2**test" {
-		t.Fatalf("session cookie = %q", cfg.WorkspaceUsage.SessionCookie)
-	}
-	if len(cfg.WorkspaceUsage.WorkspaceIDs) != 2 || cfg.WorkspaceUsage.WorkspaceIDs[1] != "wrk_b" {
-		t.Fatalf("workspace ids = %v", cfg.WorkspaceUsage.WorkspaceIDs)
+	if cfg.WorkspaceUsage.ServiceAPIKey != "oc_sk_test" {
+		t.Fatalf("service key = %q", cfg.WorkspaceUsage.ServiceAPIKey)
 	}
 	if cfg.WorkspaceUsage.Interval != 90*time.Second {
 		t.Fatalf("interval = %v", cfg.WorkspaceUsage.Interval)
@@ -1724,22 +1721,48 @@ func TestWorkspaceUsageConfigDefaultsAndValidation(t *testing.T) {
 
 func TestWorkspaceUsageEnvOverrides(t *testing.T) {
 	base := defaultConfig()
-	t.Setenv("OPENCODE_SESSION_COOKIE", "cookie-value")
-	t.Setenv("OPENCODE_WORKSPACE_IDS", "wrk_a, wrk_b")
+	t.Setenv("OPENCODE_SERVICE_API_KEY", "oc_sk_env")
+	t.Setenv("OPENCODE_SESSION_COOKIE", "ignored")
 	t.Setenv("WORKSPACE_USAGE_INTERVAL", "5s")
 	t.Setenv("DASHBOARD_AUTO_KEY", "true")
 	applyEnvOverrides(&base)
-	if base.WorkspaceUsage.SessionCookie != "cookie-value" {
-		t.Fatalf("cookie = %q", base.WorkspaceUsage.SessionCookie)
-	}
-	if len(base.WorkspaceUsage.WorkspaceIDs) != 2 || base.WorkspaceUsage.WorkspaceIDs[0] != "wrk_a" {
-		t.Fatalf("ids = %v", base.WorkspaceUsage.WorkspaceIDs)
+	if base.WorkspaceUsage.ServiceAPIKey != "oc_sk_env" {
+		t.Fatalf("service key = %q", base.WorkspaceUsage.ServiceAPIKey)
 	}
 	if base.WorkspaceUsage.Interval != 5*time.Second {
 		t.Fatalf("interval = %v", base.WorkspaceUsage.Interval)
 	}
 	if base.DashboardAutoKey != "true" {
 		t.Fatalf("dashboard auto key = %q", base.DashboardAutoKey)
+	}
+}
+
+func TestWorkspaceUsageLegacySessionCookieIgnored(t *testing.T) {
+	yaml := `
+server:
+  proxy_api_key: "k"
+upstream:
+  api_keys: ["sk-1"]
+workspace_usage:
+  session_cookie: "Fe26.2**old"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	cfg, err := loadYAMLConfig(path)
+	if err != nil {
+		t.Fatalf("loadYAMLConfig: %v", err)
+	}
+	if cfg.WorkspaceUsage.ServiceAPIKey != "" {
+		t.Fatalf("legacy cookie must not become a service key, got %q", cfg.WorkspaceUsage.ServiceAPIKey)
+	}
+	if !strings.Contains(buf.String(), "session_cookie is no longer supported") {
+		t.Fatalf("expected a deprecation warning, got %q", buf.String())
 	}
 }
 

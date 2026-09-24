@@ -109,8 +109,7 @@ type Config struct {
 }
 
 type WorkspaceUsageConfig struct {
-	SessionCookie string
-	WorkspaceIDs  []string
+	ServiceAPIKey string
 	Interval      time.Duration
 }
 
@@ -229,9 +228,10 @@ type yamlConfig struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
 	WorkspaceUsage struct {
-		SessionCookie string   `yaml:"session_cookie"`
-		WorkspaceIDs  []string `yaml:"workspace_ids"`
-		Interval      string   `yaml:"interval"`
+		ServiceAPIKey string `yaml:"service_api_key"`
+		// Deprecated: ignored. Kept so old configs load and log a warning.
+		SessionCookie string `yaml:"session_cookie"`
+		Interval      string `yaml:"interval"`
 	} `yaml:"workspace_usage"`
 }
 
@@ -304,11 +304,8 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		wsInterval = d
 	}
-	wsIDs := make([]string, 0, len(yc.WorkspaceUsage.WorkspaceIDs))
-	for _, id := range yc.WorkspaceUsage.WorkspaceIDs {
-		if id = strings.TrimSpace(id); id != "" {
-			wsIDs = append(wsIDs, id)
-		}
+	if strings.TrimSpace(yc.WorkspaceUsage.SessionCookie) != "" {
+		log.Printf("workspace_usage.session_cookie is no longer supported and was ignored; use workspace_usage.service_api_key")
 	}
 
 	proactiveThreshold := -1.0
@@ -373,8 +370,7 @@ func loadYAMLConfig(path string) (Config, error) {
 		Alerts:                   alerts,
 		DashboardAutoKey:         yc.Server.DashboardAutoKey,
 		WorkspaceUsage: WorkspaceUsageConfig{
-			SessionCookie: strings.TrimSpace(yc.WorkspaceUsage.SessionCookie),
-			WorkspaceIDs:  wsIDs,
+			ServiceAPIKey: strings.TrimSpace(yc.WorkspaceUsage.ServiceAPIKey),
 			Interval:      wsInterval,
 		},
 		SMTP: SMTPConfig{
@@ -470,11 +466,8 @@ func mergeConfig(dst *Config, src Config) {
 	if src.DashboardAutoKey != "" {
 		dst.DashboardAutoKey = src.DashboardAutoKey
 	}
-	if src.WorkspaceUsage.SessionCookie != "" {
-		dst.WorkspaceUsage.SessionCookie = src.WorkspaceUsage.SessionCookie
-	}
-	if len(src.WorkspaceUsage.WorkspaceIDs) > 0 {
-		dst.WorkspaceUsage.WorkspaceIDs = append([]string(nil), src.WorkspaceUsage.WorkspaceIDs...)
+	if src.WorkspaceUsage.ServiceAPIKey != "" {
+		dst.WorkspaceUsage.ServiceAPIKey = src.WorkspaceUsage.ServiceAPIKey
 	}
 	if src.WorkspaceUsage.Interval >= 0 {
 		dst.WorkspaceUsage.Interval = src.WorkspaceUsage.Interval
@@ -642,19 +635,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("SMTP_STARTTLS"); v != "" {
 		cfg.SMTP.StartTLS = parseBool(v)
 	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_SESSION_COOKIE")); v != "" {
-		cfg.WorkspaceUsage.SessionCookie = v
-	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_WORKSPACE_IDS")); v != "" {
-		var ids []string
-		for _, id := range strings.Split(v, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				ids = append(ids, id)
-			}
-		}
-		if len(ids) > 0 {
-			cfg.WorkspaceUsage.WorkspaceIDs = ids
-		}
+	if v := strings.TrimSpace(os.Getenv("OPENCODE_SERVICE_API_KEY")); v != "" {
+		cfg.WorkspaceUsage.ServiceAPIKey = v
 	}
 	if v := strings.TrimSpace(os.Getenv("WORKSPACE_USAGE_INTERVAL")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
@@ -721,7 +703,7 @@ func validateConfig(cfg Config) error {
 func safeConfigSummary(cfg Config) string {
 	strategy := defaultString(cfg.RoutingStrategy, "session_sticky")
 	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d strategy=%s session_ttl=%s balanced_idle_timeout=%s usage_check_interval=%s proactive_threshold=%.1f%% polling_disabled=%t smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s workspace_usage=%t dashboard_auto_key=%s",
-		cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), strategy, cfg.SessionTTL, cfg.BalancedIdleTimeout, cfg.UsageCheckInterval, cfg.ProactiveSwitchThreshold, cfg.DisableUsagePolling, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, len(cfg.WorkspaceUsage.SessionCookie) > 0, defaultString(cfg.DashboardAutoKey, "auto"))
+		cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), strategy, cfg.SessionTTL, cfg.BalancedIdleTimeout, cfg.UsageCheckInterval, cfg.ProactiveSwitchThreshold, cfg.DisableUsagePolling, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, len(cfg.WorkspaceUsage.ServiceAPIKey) > 0, defaultString(cfg.DashboardAutoKey, "auto"))
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
@@ -2233,7 +2215,7 @@ func newApp(cfg Config) *App {
 	app.sender.Store(NewAlertNotifier(cfg.SMTP, cfg.Alerts))
 	app.workspace.Store(NewWorkspaceUsageClient(
 		"",
-		cfg.WorkspaceUsage.SessionCookie,
+		cfg.WorkspaceUsage.ServiceAPIKey,
 	))
 	return app
 }
@@ -2357,7 +2339,7 @@ func (a *App) applyConfig(newCfg Config) {
 	if prev == nil || !reflect.DeepEqual(prev.WorkspaceUsage, newCfg.WorkspaceUsage) {
 		a.workspace.Store(NewWorkspaceUsageClient(
 			"",
-			newCfg.WorkspaceUsage.SessionCookie,
+			newCfg.WorkspaceUsage.ServiceAPIKey,
 		))
 	}
 	if prev == nil || prev.UsageCheckInterval != newCfg.UsageCheckInterval || prev.DisableUsagePolling != newCfg.DisableUsagePolling {

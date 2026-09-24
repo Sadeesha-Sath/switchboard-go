@@ -133,7 +133,7 @@ http://127.0.0.1:8080/dashboard/
 It shows per-key quota windows (rolling/weekly/monthly), pool aggregates, key
 states and cooldowns, live request/latency metrics, and the admin actions
 (validate keys, reset keys, reload config). Model aliases from your config are
-listed in the footer. When `workspace_usage.session_cookie` is configured, a workspace usage section shows per-workspace per-model cost and quota breakdowns, and the dashboard can auto-fill the proxy key on first load when `server.dashboard_auto_key` is `auto` (loopback-only) or `true` (always).
+listed in the footer. When `workspace_usage.service_api_key` is configured, a workspace usage section shows per-workspace per-model cost and quota breakdowns, and the dashboard can auto-fill the proxy key on first load when `server.dashboard_auto_key` is `auto` (loopback-only) or `true` (always).
 
 The dashboard shell loads without authentication. Data calls use your
 `PROXY_API_KEY`, entered once in the dashboard's Settings panel and stored in
